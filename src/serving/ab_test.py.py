@@ -1,10 +1,11 @@
 # Databricks notebook source
-# DBTITLE 1,Title
+# DBTITLE 1,A/B Test Resolution — Advisor Risk Scoring
 # MAGIC %md
-# MAGIC # A/B Test Resolution
+# MAGIC # A/B Test Resolution — Advisor Risk Scoring
 # MAGIC Resolves the champion/challenger A/B test on the serving endpoint.
-# MAGIC Checks production monitoring metrics, archives the loser with a timestamped alias,
-# MAGIC promotes the winner to `@champion`, and drives 100% traffic to it.
+# MAGIC Compares metrics (MLflow training for now; production monitoring once `drift.py` is wired up),
+# MAGIC archives the loser with a timestamped alias, promotes the winner to `@champion`,
+# MAGIC and drives 100% traffic to it.
 # MAGIC
 # MAGIC Runs on a **separate schedule** from the retrain pipeline (e.g., daily),
 # MAGIC after enough production traffic has been collected on the 50/50 split.
@@ -23,13 +24,8 @@ logger = get_logger("serving.ab_test")
 w = WorkspaceClient()
 mlflow_client = MlflowClient(registry_uri="databricks-uc")
 
-_pyfunc_model = f"{CFG.fq_model_name}_pyfunc"
-_profile_table = f"{CFG.catalog}.{CFG.schema}.customer_n_transactions_drift_profile_metrics"
-_drift_table = f"{CFG.catalog}.{CFG.schema}.customer_n_transactions_drift_drift_metrics"
-
-logger.info(f"Pyfunc model:  {_pyfunc_model}")
+logger.info(f"Pyfunc model:  {CFG.fq_pyfunc_model_name}")
 logger.info(f"Endpoint:      {CFG.endpoint_name}")
-logger.info(f"Profile table: {_profile_table}")
 
 # COMMAND ----------
 
@@ -46,14 +42,14 @@ def check_active_split():
     Returns (champion_mv, challenger_mv) or raises if no active split.
     """
     try:
-        champion_mv = mlflow_client.get_model_version_by_alias(_pyfunc_model, "champion")
+        champion_mv = mlflow_client.get_model_version_by_alias(CFG.fq_pyfunc_model_name, CFG.model_champion_alias)
     except Exception:
-        raise RuntimeError("No @champion alias on pyfunc model. Nothing to resolve.")
+        raise RuntimeError(f"No @{CFG.model_champion_alias} alias on pyfunc model. Nothing to resolve.")
 
     try:
-        challenger_mv = mlflow_client.get_model_version_by_alias(_pyfunc_model, "challenger")
+        challenger_mv = mlflow_client.get_model_version_by_alias(CFG.fq_pyfunc_model_name, CFG.model_challenger_alias)
     except Exception:
-        logger.info("No @challenger alias found — no active A/B test to resolve.")
+        logger.info(f"No @{CFG.model_challenger_alias} alias found — no active A/B test to resolve.")
         return None, None
 
     if champion_mv.version == challenger_mv.version:
@@ -68,16 +64,15 @@ def check_active_split():
 # DBTITLE 1,Get Metrics
 # MAGIC %md
 # MAGIC ## Get Metrics
-# MAGIC Use the **1 week** granularity from monitoring profile_metrics (matches the
-# MAGIC `["1 day", "1 week"]` granularities configured in `drift.py`).
-# MAGIC Fall back to MLflow training metrics if monitoring data is unavailable.
+# MAGIC Currently uses MLflow training metrics logged by `train.py` / `pyfunc_wrapper.py`.
+# MAGIC Once `drift.py` is wired up, replace with production monitoring metrics.
 
 # COMMAND ----------
 
 # DBTITLE 1,Get Metrics
 def _get_mlflow_metric(version: str, metric: str) -> float:
     """Get a training metric from the MLflow run for a pyfunc model version."""
-    mv = mlflow_client.get_model_version(_pyfunc_model, str(version))
+    mv = mlflow_client.get_model_version(CFG.fq_pyfunc_model_name, str(version))
     return mlflow_client.get_run(mv.run_id).data.metrics.get(metric, 0.0)
 
 
@@ -90,36 +85,9 @@ def get_model_scores(champion_mv, challenger_mv, primary_metric="recall"):
 
     Returns (champ_score, chal_score, source_label).
     """
-    # --- Try monitoring profile_metrics (1 week granularity) ---
-    try:
-        df = spark.sql(f"""
-            SELECT model_id,
-                   {primary_metric} AS score,
-                   window.end AS window_end
-            FROM   {_profile_table}
-            WHERE  granularity = '1 week'
-              AND  column_name = ':table'
-              AND  slice_key IS NULL
-              AND  {primary_metric} IS NOT NULL
-            ORDER BY window.end DESC
-        """)
-        # Take the most recent 1-week window per model_id
-        rows = {}
-        for r in df.collect():
-            if r["model_id"] not in rows:
-                rows[r["model_id"]] = r["score"]
-        if len(rows) >= 2:
-            # model_id in the monitor is the model_uri string
-            champ_id = f"models:/{_pyfunc_model}@champion"
-            chal_id = f"models:/{_pyfunc_model}@challenger"
-            if champ_id in rows and chal_id in rows:
-                logger.info("Using production monitoring metrics (1 week granularity)")
-                return rows[champ_id], rows[chal_id], "monitoring_1week"
-    except Exception as e:
-        logger.warning(f"Monitoring metrics unavailable: {e}")
-
-    # --- Fallback: MLflow training metrics ---
-    logger.info("Falling back to MLflow training metrics")
+    # MLflow training metrics (logged by train.py / pyfunc_wrapper.py)
+    # TODO: Replace with production monitoring metrics once drift.py is wired up
+    logger.info("Using MLflow training metrics")
     champ_score = _get_mlflow_metric(champion_mv.version, primary_metric)
     chal_score = _get_mlflow_metric(challenger_mv.version, primary_metric)
     return champ_score, chal_score, "mlflow_training"
@@ -166,23 +134,23 @@ def resolve_ab_test(primary_metric: str = "recall"):
 
     # --- Archive the loser ---
     archive_alias = f"archive_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    mlflow_client.set_registered_model_alias(_pyfunc_model, archive_alias, loser_mv.version)
+    mlflow_client.set_registered_model_alias(CFG.fq_pyfunc_model_name, archive_alias, loser_mv.version)
     logger.info(f"Archived v{loser_mv.version} as @{archive_alias}")
 
     # --- Promote winner to @champion ---
-    mlflow_client.set_registered_model_alias(_pyfunc_model, "champion", winner_mv.version)
+    mlflow_client.set_registered_model_alias(CFG.fq_pyfunc_model_name, CFG.model_champion_alias, winner_mv.version)
     logger.info(f"Promoted v{winner_mv.version} to @champion")
 
     # --- Remove @challenger alias ---
     try:
-        mlflow_client.delete_registered_model_alias(_pyfunc_model, "challenger")
+        mlflow_client.delete_registered_model_alias(CFG.fq_pyfunc_model_name, CFG.model_challenger_alias)
         logger.info("Removed @challenger alias")
     except Exception:
         pass
 
     # --- Update endpoint: 100% traffic to winner ---
     winner_entity = ServedEntityInput(
-        entity_name=_pyfunc_model,
+        entity_name=CFG.fq_pyfunc_model_name,
         entity_version=winner_mv.version,
         workload_size=CFG.endpoint_workload_size,
         scale_to_zero_enabled=CFG.endpoint_scale_to_zero,

@@ -1,5 +1,5 @@
 bundle:
-  name: fraud-model-mlops
+  name: advisor-risk-mlops
 
 workspace:
   host: https://adb-5944275879339631.11.azuredatabricks.net
@@ -20,10 +20,19 @@ variables:
     default: siva_borusu
   model_name:
     description: Registered model name (without catalog.schema prefix)
-    default: fraud_model_credit_card
+    default: advisor_risk_model
+  pyfunc_model_name:
+    description: PyFunc wrapper model name (without catalog.schema prefix)
+    default: advisor_risk_model_pyfunc
   endpoint_name:
     description: Model Serving endpoint name
-    default: fraud-model-credit-card
+    default: advisor-risk-model
+  drift_table:
+    description: Drift monitoring table name (without catalog.schema prefix)
+    default: advisor_risk_features_drift
+  training_table:
+    description: Training features table name (without catalog.schema prefix)
+    default: advisor_risk_features
   warehouse_id:
     description: SQL warehouse ID for alerts and monitoring queries
   git_branch:
@@ -31,7 +40,7 @@ variables:
     default: dev
   experiment_name:
     description: MLflow experiment path for training runs
-    default: /Shared/fraud-model-experiment-dev
+    default: /Shared/advisor-risk-experiment
   notify_email:
     description: Email address for alert and job failure notifications
     default: siva.borusu@jrvs.ca
@@ -51,7 +60,7 @@ targets:
       schema: siva_borusu
       warehouse_id: "960eea0736a2e75b"
       git_branch: dev
-      experiment_name: /Shared/fraud-model-experiment-dev
+      experiment_name: /Shared/advisor-risk-experiment
 
   prod:
     mode: production
@@ -60,9 +69,9 @@ targets:
     variables:
       catalog: mlops_prod
       schema: siva_borusu
-      endpoint_name: fraud-model-credit-card-prod
+      endpoint_name: advisor-risk-model-prod
       warehouse_id: "960eea0736a2e75b"
       git_branch: main
-      experiment_name: /Shared/fraud-model-experiment-prod
+      experiment_name: /Shared/advisor-risk-experiment-prod
     run_as:
       user_name: siva.borusu@jrvs.ca

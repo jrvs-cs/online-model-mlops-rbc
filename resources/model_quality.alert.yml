@@ -6,7 +6,7 @@
 resources:
   alerts:
     model_quality_alert:
-      display_name: "[${bundle.target}] Fraud Model - Quality Degradation"
+      display_name: "[${bundle.target}] Advisor Risk - Quality Degradation"
       query_text: |
         SELECT
           window.start           AS window_start,
@@ -17,7 +17,7 @@ resources:
           precision.weighted     AS precision_weighted,
           recall.weighted        AS recall_weighted,
           f1_score.weighted      AS f1_weighted
-        FROM ${var.catalog}.${var.schema}.customer_n_transactions_drift_profile_metrics
+        FROM ${var.catalog}.${var.schema}.${var.drift_table}_profile_metrics
         WHERE column_name = ':table'
           AND log_type = 'INPUT'
           AND slice_key IS NULL

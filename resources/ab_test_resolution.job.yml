@@ -8,7 +8,7 @@
 resources:
   jobs:
     ab_test_resolution:
-      name: "[${bundle.target}] A/B Test Resolution"
+      name: "[${bundle.target}] Advisor Risk - A/B Test Resolution"
 
       git_source:
         git_url: https://github.com/siva-borusu-jrvs/fraud-model-mlops.git
@@ -23,7 +23,7 @@ resources:
             num_workers: 1
             data_security_mode: "SINGLE_USER"
             custom_tags:
-              project: "fraud-model-mlops"
+              project: "advisor-risk-mlops"
               environment: "${bundle.target}"
 
       parameters:

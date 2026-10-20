@@ -1,141 +1,297 @@
-# fraud-model-mlops
+# Advisor Risk Scoring — MLOps Pipeline
 
-End-to-end MLOps pipeline for online fraud detection on Databricks.
+End-to-end MLOps demo for advisor risk scoring on Databricks.
+Built with synthetic data matching the client's **Advisor 360** schema.
+The client replaces the synthetic data and dummy model with their own — the
+MLOps infrastructure (feature engineering → training → serving → monitoring)
+stays the same.
+
+---
+
+## Quick Start — Run Sequence
+
+Run the notebooks in this order the first time. Each step builds on the
+previous one.
+
+### 1. Synthetic Data Generation (placeholder — do not run in client env)
+
+**Notebook:** `notebooks/synthetic_data`
+
+Generates three source tables that match the client's Advisor 360 schema:
+
+| Table | Rows | Description |
+| --- | --- | --- |
+| `book_profile_360` | 21,000 | Advisor performance vs team/region benchmarks (6 metrics × 7 months × 500 advisors) |
+| `tools_adoption_360` | 21,000 | Tool usage sessions (6 tools × 7 months × 500 advisors) |
+| `advisor_holdings_360` | \~17,500 | Fund holdings per advisor (variable fund count × 7 months) |
+
+**This is a placeholder.** The client does **not** run this — they already
+have the real tables in their catalog. We provide this so the demo runs
+end-to-end without client data access.
+
+---
+
+### 2. Configuration
+
+**File:** `src/config.yaml`
+
+Single source of truth for the entire pipeline. The client updates **two lines**
+to point at their environment:
+
+```yaml
+# Dev / demo (current)
+catalog: mlops
+schema: siva_borusu
+
+# Client environment (uncomment below, comment out above)
+# catalog: t1u0_n_gamdna_gold
+# schema: es_advisor_360
+```
+
+**Everything else — table names, model names, endpoint settings, warehouse ID,
+monitoring thresholds — should be updated accordingly in `config.yaml`** and
+will propagate automatically via `src/config.py`.
+
+All notebooks import `from src.config import CFG` and read settings from there.
+No hardcoded values anywhere.
+
+---
+
+### 3. Feature Engineering
+
+**Notebook:** `src/feature_engineering/build_features`
+
+Reads the three source tables for the latest available month and engineers
+**14 numeric features** across three domains:
+
+**Book profile (7 features):**
+`avg_advisor_value`, `avg_vs_team_ratio`, `avg_vs_region_ratio`,
+`metrics_below_team`, `metrics_below_region`, `pct_below_team`, `pct_below_region`
+
+**Tool adoption (3 features):**
+`total_advisor_sessions`, `tools_adopted_count`, `avg_sessions_vs_team`
+
+**Holdings / portfolio concentration (4 features):**
+`total_aum`, `num_funds`, `max_fund_pct`, `hhi_concentration`
+
+**Writes two tables:**
+
+| Table | Key | Purpose |
+| --- | --- | --- |
+| `advisor_risk_features` | `Salesforce_Id__c` | Training — 14 features + `at_risk` label |
+| `advisor_serving_features` | `Salesforce_Id__c` | Serving lookup — 14 features, **no label**, de-duplicated. This is what the real-time endpoint loads at startup to look up features by advisor ID. |
+
+**Drift monitoring table:** The notebook also writes `advisor_risk_features_drift`,
+a copy of the training data with real labels. **⚠️ This is a demo scaffold only.
+In production the client must build a pipeline (e.g. a Lakeflow Spark Declarative
+Pipeline or scheduled job) that populates this table from real scored traffic
+with real labels — not a training-set copy.** Monitoring and alerting depend on
+this table reflecting actual inference-time data.
+
+**Synthetic label:** `at_risk = 1` when an advisor underperforms team benchmarks
+on >50% of metrics, has adopted fewer than 4 tools, and has a concentrated
+portfolio (HHI > 0.25). The client replaces this with their own label logic.
+
+---
+
+### 4. Experimentation (Hyperparameter Tuning)
+
+**Notebook:** `src/models/experimentation_optuna_mlflow_tracking`
+
+Runs **Optuna** hyperparameter tuning (20 trials) on a LightGBM classifier
+with median imputation. All trials logged to MLflow experiment
+`/Shared/advisor-risk-experiment`.
+
+- Reads the three source tables directly and engineers features inline
+  (self-contained — does not depend on the pre-built training table)
+- Pipeline: `SimpleImputer(median)` → `LGBMClassifier`
+- Optimizes for **recall** via 5-fold stratified cross-validation
+- **No model registration** — pure experimentation
+- **Last cell prints the `best_params` dict for copy-paste into production training**
+
+---
+
+### 5. Production Training
+
+**Notebook:** `src/models/train.py`
+
+Trains the final model with the **best Optuna params** (copy-pasted from step 4)
+and registers it to Unity Catalog.
+
+- Reads the pre-built `advisor_risk_features` table (from step 3)
+- Pipeline: `SimpleImputer(median)` → `LGBMClassifier` with best params
+- Logs params + metrics to MLflow, registers model as `advisor_risk_model`
+- **Assigns `@champion` alias** to the newly registered version
+- All config (model name, experiment, alias) from `config.yaml`
+
+---
+
+### 6. PyFunc Wrapper & Model Registration
+
+**Notebook:** `src/models/pyfunc_wrapper.py`
+
+Wraps the sklearn pipeline in a custom `mlflow.pyfunc.PythonModel` for
+real-time serving. The endpoint receives **only `Salesforce_Id__c`** — all 14
+features are looked up server-side.
+
+**How the feature lookup works at serving time:**
+
+The serving container has no Spark. It uses the **Databricks SDK +
+Statement Execution API** to query the `advisor_serving_features` table
+(written in step 3) via the SQL warehouse configured in `config.yaml`.
+OAuth M2M credentials are auto-provisioned via declared `resources`
+(`DatabricksSQLWarehouse` + `DatabricksTable`) — no manual tokens.
+
+Features are loaded into a pandas DataFrame once at startup, then joined
+by `Salesforce_Id__c` on each predict call.
+
+**Safety guards:**
+- **Truncation check:** raises `RuntimeError` if the Statement Execution API
+  caps results (100K row limit)
+- **Unknown ID warning:** logs unmatched `Salesforce_Id__c` values; the
+  `SimpleImputer` fills NaN features with training medians so it won't crash
+
+**Registers two versions** (both needed for the A/B test demo):
+- `advisor_risk_model_pyfunc` `@champion`
+- `advisor_risk_model_pyfunc` `@challenger`
+
+The client replaces the challenger with a genuinely different model later.
+
+**Endpoint request:**
+```json
+{
+  "dataframe_records": [
+    {"Salesforce_Id__c": "0031I0000084aadQAA"}
+  ]
+}
+```
+
+**Endpoint response:**
+```json
+{
+  "predictions": [
+    {"Salesforce_Id__c": "0031I0000084aadQAA", "at_risk": 0, "at_risk_probability": 0.03}
+  ]
+}
+```
+
+All pip dependencies are pinned to the exact versions on the training cluster.
+
+---
+
+### 7. Deployment
+
+**Notebook:** `src/serving/deploy.py`
+
+Creates (or updates) the Model Serving endpoint with a **50/50 traffic split**
+between champion and challenger, then enables AI Gateway logging.
+
+- Resolves `@champion` and `@challenger` aliases on the pyfunc model
+- Creates the endpoint if it doesn't exist, updates config if it does
+- **Enables AI Gateway inference table** — request/response payloads are logged
+  to `{catalog}.{schema}` as an OpenTelemetry-backed inference table
+- **Enables usage tracking** — token/request counts flow to `system.ai_gateway.usage`
+- Endpoint name, workload size, scale-to-zero, warehouse ID — all from `config.yaml`
+- No separate logging notebook needed — `deploy.py` handles everything
+
+---
+
+### 8. Monitoring & Alerting (fully declarative via DABs)
+
+Monitoring and alerting are **100% declarative** — no notebooks, no SDK scripts.
+Everything is deployed with a single `bundle deploy`.
+
+**Quality Monitor** (`resources/advisor_drift.quality_monitor.yml`):
+
+A Lakehouse Quality Monitor (InferenceLog type) on `advisor_risk_features_drift`:
+- Compares against `advisor_risk_features` (training baseline)
+- Outputs `_profile_metrics` and `_drift_metrics` tables to `{catalog}.{schema}`
+- Refreshes daily at 08:00 ET on its own schedule
+- Fully parameterized via `databricks.yml` variables
+
+**SQL Alerts** (deployed automatically with `bundle deploy`):
+
+| Alert | Resource file | Trigger |
+| --- | --- | --- |
+| Feature drift vs baseline | `feature_drift.alert.yml` | KS or chi-squared p-value < 0.05 |
+| Model quality degradation | `model_quality.alert.yml` | Recall < 0.40, precision < 0.50, or F1 < 0.45 |
+| Prediction PSI shift | `prediction_psi.alert.yml` | PSI > 0.2 vs baseline |
+
+All alerts run daily at 08:30 ET (30 min after monitor refresh), notify via email,
+and are parameterized through `databricks.yml` variables (`${var.drift_table}`,
+`${var.warehouse_id}`, `${var.notify_email}`).
+
+**⚠️ The `advisor_risk_features_drift` table is seeded from training data as a demo
+scaffold. In production, the client must build a pipeline to populate it from real
+scored traffic with real labels.** See step 11 in the client checklist below.
+
+---
 
 ## Project Structure
 
 ```
-fraud-model-mlops/
-├── databricks.yml                # DABs config (dev + prod targets)
-├── resources/
-│   ├── fraud_model_job.yml       # Pipeline job: ingest->features->train->evaluate->deploy
-│   ├── monitoring_job.yml        # Scheduled daily drift monitoring job
-│   ├── alerts.yml                # SQL alerts for drift + prediction volume
-│   └── registered_model.yml      # UC registered model + MLflow experiment
-├──
-├── src/                          # Source code
-│   ├── __init__.py               # Package init
-│   ├── config.py                 # Central config (catalog, schema, model, endpoint)
-│   ├── data/
-│   │   ├── ingestion.py          # [notebook] Raw data ingestion (batch + Auto Loader)
-│   │   └── features.py           # [notebook] Feature engineering (Delta feature store)
+online-model-mlops-rbc/
+├── src/
+│   ├── config.yaml                  # Single source of truth
+│   ├── config.py                    # Python wrapper (CFG singleton)
+│   ├── utils.py                     # Logger utility
+│   ├── feature_engineering/
+│   │   └── build_features           # Feature engineering notebook
 │   ├── models/
-│   │   ├── train.py              # [notebook] Model training with MLflow
-│   │   └── evaluate.py           # [notebook] Champion/challenger evaluation
+│   │   ├── experimentation_optuna_mlflow_tracking
+│   │   ├── train.py                 # Production training + UC registration
+│   │   └── pyfunc_wrapper.py        # PyFunc wrapper + serving lookup
 │   ├── serving/
-│   │   ├── deploy.py             # [notebook] Model Serving endpoint deployment
-│   │   └── ab_test.py            # [notebook] A/B traffic routing setup
-│   └── monitoring/
-│       ├── drift.py              # [notebook] PSI drift detection
-│       └── alerts.sql            # SQL alert definitions for drift triggers
-├── tests/
-│   ├── unit/
-│   │   ├── test_features.py      # Feature engineering unit tests
-│   │   └── test_model.py         # Model training unit tests
-│   └── integration/
-│       └── test_pipeline.py      # End-to-end pipeline integration tests
+│   │   └── deploy.py                # Endpoint deployment (50/50 A/B)
+├── resources/                           # DABs resource definitions
+│   ├── advisor_drift.quality_monitor.yml  # Lakehouse Quality Monitor (declarative)
+│   ├── feature_drift.alert.yml            # SQL alert: feature drift vs baseline
+│   ├── model_quality.alert.yml            # SQL alert: recall/precision/F1 degradation
+│   ├── prediction_psi.alert.yml           # SQL alert: prediction PSI shift
+│   ├── advisor_risk_retrain.job.yml       # Weekly retrain pipeline
+│   └── ab_test_resolution.job.yml         # Weekly A/B test resolution
 ├── notebooks/
-│   ├── eda.py                    # [notebook] Exploratory data analysis
-│   └── demo.py                   # [notebook] Full pipeline walkthrough
-├── conf/
-│   ├── cluster.json              # ML cluster configuration
-│   └── serving.json              # Serving endpoint configuration
-├── jobs/
-│   └── pipeline.py               # [notebook] Orchestration entry point for Jobs
-├── requirements.txt
-├── .gitignore
-└── README.md
+│   └── synthetic_data               # Synthetic data generation (placeholder)
+├── databricks.yml                     # DABs bundle config (variables, targets)
+└── README.md          # This file
 ```
 
-Files marked `[notebook]` use `# Databricks notebook source` format — they render as
-standard Python on GitHub but open as interactive notebooks in Databricks.
+---
 
-## Resources
+## Key Tables
 
-| Resource | Purpose |
-| --- | --- |
-| ML Cluster | Training and feature engineering compute |
-| Unity Catalog | `ml.fraud.*` tables (raw, features, predictions, drift) |
-| Model Serving Endpoint | `fraud-classifier-endpoint` for real-time inference |
-| Delta Feature Store | `ml.fraud.fraud_features` — offline feature table |
-| DQ Monitor | Lakehouse Monitoring on predictions table (auto drift detection) |
-| SQL Alerts | Fires on DQ Monitor drift metrics → triggers retrain via webhook |
-| AI/BI Dashboard | Model A/B comparison (champion vs challenger) |
-
-## Quick Start
-
-### First-time (interactive)
-
-1. **Configure** — Edit `src/config.py` defaults or set DABs target
-2. **Ingest** — Run `src/data/ingestion.py` interactively to load raw data
-3. **Features** — Run `src/data/features.py` to build the feature table
-4. **EDA** — Use `notebooks/eda` to explore distributions and validate features
-5. **Train** — Run `src/models/train.py` interactively, iterate on hyperparams
-6. **Promote** — Run `src/models/evaluate.py` to tag your first champion
-7. **Deploy** — Run `src/serving/deploy.py` to create the serving endpoint
-
-### Ongoing (automated via DABs)
-
-Once a champion model is registered, deploy the retraining pipeline:
-
-1. `databricks bundle deploy -t prod`
-2. The retrain job runs: ingest → features → retrain → evaluate vs champion → redeploy if promoted
-3. DQ Monitor watches predictions table for drift; SQL alert triggers retrain job via webhook
-
-## Testing
-
-```bash
-# Unit tests (no cluster needed)
-pytest tests/unit/ -v
-
-# Integration tests (requires Databricks cluster + UC access)
-pytest tests/integration/ -v -m integration
-```
-
-## Architecture
-
-![Fraud detection MLOps architecture](docs/model-architecture.png)
-
-## Deployment (DABs)
-
-This project uses Declarative Automation Bundles for two-target deployment.
-Same workspace host, different catalogs for full environment isolation.
-
-| Setting | dev | prod |
+| Table | Type | Purpose |
 | --- | --- | --- |
-| Catalog | `ml_dev` | `ml` |
-| Schema | `fraud_dev` | `fraud` |
-| Model | `fraud_classifier_dev` | `fraud_classifier` |
-| Endpoint | `fraud-classifier-dev` | `fraud-classifier` |
-| Experiment | `fraud-model-experiment-dev` | `fraud-model-experiment-prod` |
-| Job prefix | `[dev]` | `[prod]` |
+| `book_profile_360` | Source | Advisor performance benchmarks |
+| `tools_adoption_360` | Source | Tool usage sessions |
+| `advisor_holdings_360` | Source | Fund holdings |
+| `advisor_risk_features` | Training | 14 features + `at_risk` label |
+| `advisor_serving_features` | Serving | 14 features, no label — real-time endpoint lookup |
+| `advisor_risk_features_drift` | Monitoring | Copy of training data (demo); **replace with real scored traffic + labels via a pipeline** |
 
-### Commands
+All tables live in `{catalog}.{schema}` as configured in `config.yaml`.
 
-```bash
-# Validate
-databricks bundle validate -t dev
-databricks bundle validate -t prod
+---
 
-# Deploy
-databricks bundle deploy -t dev
-databricks bundle deploy -t prod
+## Key Models (Unity Catalog)
 
-# Run the retrain pipeline (after champion exists)
-databricks bundle run fraud_model_retrain -t dev
-databricks bundle run fraud_model_retrain -t prod
+| Model | Alias | Purpose |
+| --- | --- | --- |
+| `advisor_risk_model` | `@champion` | sklearn pipeline (SimpleImputer + LGBMClassifier) |
+| `advisor_risk_model_pyfunc` | `@champion`, `@challenger` | PyFunc wrapper with feature lookup for serving |
 
-# Run drift monitoring
-databricks bundle run fraud_drift_monitoring -t dev
+---
 
-# Destroy
-databricks bundle destroy -t dev --auto-approve
-```
+## For the Client
 
-### How Environment Flows Through
-
-1. `databricks.yml` targets set `${var.catalog}`, `${var.schema}`, etc.
-2. Resource YAMLs pass these as `base_parameters` to each notebook task.
-3. `src/config.py` reads job parameters via `dbutils.widgets` at import time.
-4. All downstream code uses `CFG.fq_*` properties, fully qualified to the right env.
-5. Interactive runs default to `ml_dev.fraud_dev` (no parameters = dev).
+1. **Skip** `notebooks/synthetic_data` — you have the real tables
+2. **Update** `src/config.yaml` — uncomment client catalog/schema, comment out demo
+3. **Update** the `sql_warehouse_id` in `config.yaml` to your warehouse
+4. **Run** `build_features` → review features, update label logic if needed
+5. **Run** `experimentation_optuna_mlflow_tracking` → copy best params
+6. **Run** `train.py` → paste best params, train and register
+7. **Run** `pyfunc_wrapper.py` → register the serving wrapper
+8. **Run** `deploy.py` → deploy the endpoint
+9. **Replace** the `at_risk` label in `build_features` with your real label
+10. **Replace** the model in `train.py` with your own — the serving pipeline stays the same
+11. **Build a pipeline** to populate `advisor_risk_features_drift` from real scored traffic with real labels — the demo copies training data as a scaffold, but drift monitoring requires actual inference-time data to be meaningful

@@ -1,29 +1,37 @@
-"""Central configuration for the fraud detection project.
+"""Project configuration — thin wrapper around config.yaml.
 
-All catalog paths, model names, endpoint names, and feature table
-references live here so every module pulls from a single source of truth.
+All settings live in src/config.yaml (single source of truth).
+This module loads the YAML once and exposes a CFG object so existing
+imports (`from src.config import CFG`) keep working.
 
-Environment-aware: when run via a DABs job, reads catalog/schema/model_name/
-endpoint_name from dbutils.widgets (passed as job base_parameters).
-When run interactively, falls back to dev defaults.
+DABs job parameters override catalog/schema/model_name/endpoint_name
+at runtime when present.
 """
 
+import yaml
+from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List
 
 
-# ── Resolve bundle variables from job parameters ───────────────────
+# ── Load YAML (colocated in src/) ─────────────────────────────────
+with open(Path(__file__).parent / "config.yaml") as _f:
+    _raw = yaml.safe_load(_f)
+
+
+# ── Resolve DABs job parameters (override YAML at runtime) ────────
 def _get_param(key: str, default: str) -> str:
     """Read a job parameter (widget) if available, else return default."""
     try:
         from pyspark.sql import SparkSession
         spark = SparkSession.getActiveSession()
         if spark:
-            return spark.conf.get(f"spark.databricks.workflow.parameters.{key}", default)
+            return spark.conf.get(
+                f"spark.databricks.workflow.parameters.{key}", default
+            )
     except Exception:
         pass
     try:
-        # Fallback: try dbutils widgets directly
         return dbutils.widgets.get(key)  # noqa: F821
     except Exception:
         return default
@@ -31,77 +39,52 @@ def _get_param(key: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class ProjectConfig:
-    """Immutable project-wide settings.
+    """Immutable project-wide settings loaded from config.yaml."""
 
-    Defaults are dev values. When deployed via DABs, job parameters
-    override catalog, schema, model_name, and endpoint_name.
-    """
-
-    # ── Unity Catalog coordinates (overridable via DABs) ───────────
-    catalog: str = "mlops"
-    schema: str = "siva_borusu"
+    # ── Unity Catalog coordinates ──────────────────────────────────
+    catalog: str = _raw["catalog"]
+    schema: str = _raw["schema"]
 
     # ── Tables ─────────────────────────────────────────────────────
-    raw_transactions_table: str = "transactions"
-    feature_table: str = "customer_n_transactions"
-    customer_features_table: str = "customer_features"
-    customer_features_drift_table: str = "customer_features_drift"
-    predictions_table: str = "fraud_predictions"
-    drift_metrics_table: str = "drift_metrics"
+    book_profile_table: str = _raw["tables"]["book_profile"]
+    tools_adoption_table: str = _raw["tables"]["tools_adoption"]
+    advisor_holdings_table: str = _raw["tables"]["advisor_holdings"]
+    training_table: str = _raw["tables"]["training"]
+    serving_features_table: str = _raw["tables"]["serving_features"]
+    drift_table: str = _raw["tables"]["drift"]
 
-    # ── Model (overridable via DABs) ───────────────────────────────
-    registered_model_name: str = "fraud_model_credit_card"
-    experiment_name: str = "/Users/siva.borusu@jrvs.ca/fraud-model-experiment"
-    model_champion_alias: str = "champion"
-    model_challenger_alias: str = "challenger"
+    # ── Model ──────────────────────────────────────────────────────
+    registered_model_name: str = _raw["model"]["registered_name"]
+    pyfunc_registered_name: str = _raw["model"]["pyfunc_registered_name"]
+    experiment_name: str = _raw["model"]["experiment_name"]
+    model_champion_alias: str = _raw["model"]["champion_alias"]
+    model_challenger_alias: str = _raw["model"]["challenger_alias"]
 
-    # ── Serving (overridable via DABs) ─────────────────────────────
-    endpoint_name: str = "fraud-model-credit-card"
-    endpoint_workload_size: str = "Small"
-    endpoint_scale_to_zero: bool = True
-
-    # ── SQL Warehouse (for pyfunc serving lookups) ─────────────────
-    # Set as env var DATABRICKS_SQL_WAREHOUSE_ID on the serving endpoint
-    sql_warehouse_id: str = "960eea0736a2e75b"
+    # ── Serving ────────────────────────────────────────────────────
+    endpoint_name: str = _raw["serving"]["endpoint_name"]
+    endpoint_workload_size: str = _raw["serving"]["workload_size"]
+    endpoint_scale_to_zero: bool = _raw["serving"]["scale_to_zero"]
+    sql_warehouse_id: str = _raw["serving"]["sql_warehouse_id"]
 
     # ── Monitoring / Alerts ────────────────────────────────────────
-    drift_threshold_psi: float = 0.2
-    drift_threshold_ks: float = 0.05
-    alert_email_recipients: list = field(
-        default_factory=lambda: ["siva.borusu@jrvs.ca"]
+    drift_threshold_psi: float = _raw["monitoring"]["drift_threshold_psi"]
+    drift_threshold_ks: float = _raw["monitoring"]["drift_threshold_ks"]
+    alert_email_recipients: List[str] = field(
+        default_factory=lambda: _raw["monitoring"]["alert_email_recipients"]
     )
 
-    # ── Cluster ────────────────────────────────────────────────────
-    cluster_policy_name: Optional[str] = None  # None -> use serverless
-
     # ── Helpers ────────────────────────────────────────────────────
-    @property
-    def fq_raw_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.{self.raw_transactions_table}"
-
-    @property
-    def fq_feature_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.{self.feature_table}"
-
-    @property
-    def fq_customer_features_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.{self.customer_features_table}"
-
-    @property
-    def fq_customer_features_drift_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.{self.customer_features_drift_table}"
-
-    @property
-    def fq_predictions_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.{self.predictions_table}"
-
-    @property
-    def fq_drift_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.{self.drift_metrics_table}"
+    def fq(self, table_key: str) -> str:
+        """Fully-qualified table name from a config tables key."""
+        return f"{self.catalog}.{self.schema}.{_raw['tables'][table_key]}"
 
     @property
     def fq_model_name(self) -> str:
         return f"{self.catalog}.{self.schema}.{self.registered_model_name}"
+
+    @property
+    def fq_pyfunc_model_name(self) -> str:
+        return f"{self.catalog}.{self.schema}.{self.pyfunc_registered_name}"
 
     @property
     def champion_model_uri(self) -> str:
@@ -113,21 +96,18 @@ class ProjectConfig:
 
 
 def build_config() -> ProjectConfig:
-    """Build config from job parameters (DABs) or use dev defaults."""
-    catalog = _get_param("catalog", "mlops")
-    schema = _get_param("schema", "siva_borusu")
-    model_name = _get_param("model_name", "fraud_model_credit_card")
-    endpoint_name = _get_param("endpoint_name", "fraud-model-credit-card")
-
+    """Build config — DABs job params override YAML defaults."""
     return ProjectConfig(
-        catalog=catalog,
-        schema=schema,
-        registered_model_name=model_name,
-        experiment_name=f"/Shared/fraud-model-experiment-{catalog.split('_')[-1] if '_' in catalog else 'prod'}",
-        endpoint_name=endpoint_name,
+        catalog=_get_param("catalog", _raw["catalog"]),
+        schema=_get_param("schema", _raw["schema"]),
+        registered_model_name=_get_param(
+            "model_name", _raw["model"]["registered_name"]
+        ),
+        endpoint_name=_get_param(
+            "endpoint_name", _raw["serving"]["endpoint_name"]
+        ),
     )
 
 
-# Singleton - import this in other modules.
-# Resolves env at import time from job params or defaults to dev.
+# Singleton — import this in other modules.
 CFG = build_config()

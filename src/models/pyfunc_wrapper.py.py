@@ -1,10 +1,10 @@
 # Databricks notebook source
 # DBTITLE 1,PyFunc Wrapper Model
 # MAGIC %md
-# MAGIC # PyFunc Wrapper Model — Credit Card Fraud Detection
+# MAGIC # PyFunc Wrapper Model — Advisor Risk Scoring
 # MAGIC Wraps the trained sklearn pipeline in a custom `mlflow.pyfunc.PythonModel` that receives
-# MAGIC a lightweight transaction payload, looks up customer features from the Delta table,
-# MAGIC computes time features, and returns a fraud prediction. No Feature Store or online table required.
+# MAGIC a `Salesforce_Id__c`, looks up the 14 pre-computed advisor features from the serving features
+# MAGIC table, and returns an at-risk prediction + probability. No Feature Store or online table required.
 
 # COMMAND ----------
 
@@ -20,62 +20,57 @@ logger = get_logger("models.pyfunc_wrapper")
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment(CFG.experiment_name)
 
+# Fully-qualified serving features table
+SERVING_FEATURES_FQ = CFG.fq("serving_features")
+
 # COMMAND ----------
 
 # DBTITLE 1,Define wrapper class
 # MAGIC %md
 # MAGIC ## PyFunc Wrapper Class
-# MAGIC The wrapper receives 8 raw transaction fields, looks up customer features from the
-# MAGIC Delta table (loaded once at startup via Databricks SDK + Statement Execution API),
-# MAGIC computes time features, and calls the inner sklearn pipeline.
+# MAGIC The wrapper receives `Salesforce_Id__c`, looks up the 14 advisor features from the
+# MAGIC serving features table (loaded once at startup via Databricks SDK + Statement Execution API),
+# MAGIC and calls the inner sklearn pipeline.
 
 # COMMAND ----------
 
-# DBTITLE 1,FraudModelWrapper class
-class FraudModelWrapper(mlflow.pyfunc.PythonModel):
+# DBTITLE 1,AdvisorRiskWrapper class
+FEATURE_COLS = [
+    # Book profile — benchmark ratios
+    "avg_advisor_value", "avg_vs_team_ratio", "avg_vs_region_ratio",
+    "metrics_below_team", "metrics_below_region",
+    "pct_below_team", "pct_below_region",
+    # Tool adoption
+    "total_advisor_sessions", "tools_adopted_count", "avg_sessions_vs_team",
+    # Holdings — portfolio concentration
+    "total_aum", "num_funds", "max_fund_pct", "hhi_concentration",
+]
+
+
+class AdvisorRiskWrapper(mlflow.pyfunc.PythonModel):
     """
-    Custom pyfunc that wraps the fraud sklearn pipeline.
+    Custom pyfunc that wraps the advisor risk sklearn pipeline.
 
     At startup (load_context):
       - Loads the inner sklearn model from artifacts
-      - Connects to the Databricks workspace via SQL connector
-      - Loads customer_features from the live Delta table
+      - Loads advisor serving features from the Delta table via Databricks SDK
 
     At predict time:
-      - Receives: card_id, transaction_timestamp, transaction_amount,
-        transaction_country, transaction_state, merchant_category,
-        transaction_status, is_vpn_used
-      - Looks up customer features by card_id (cached in memory)
-      - Computes hour_of_day and day_of_week from transaction_timestamp
-      - Assembles all 22 features and calls the inner model
+      - Receives: Salesforce_Id__c (one or more advisor IDs)
+      - Looks up the 14 pre-computed features by Salesforce_Id__c
+      - Returns: at_risk prediction (0/1) and probability
     """
 
-    CATEGORICAL_COLS = [
-        "transaction_country", "transaction_state", "merchant_category",
-        "transaction_status", "home_country", "home_state",
-    ]
-
-    NUMERIC_COLS = [
-        "transaction_amount", "avg_transaction_amount_90d", "max_monthly_spend_statement",
-        "total_transactions_90d", "avg_transactions_per_day_90d", "max_single_transaction_90d",
-        "pct_online_transactions_90d", "distinct_countries_90d", "distinct_states_90d",
-        "days_since_last_password_reset", "days_since_last_web_login",
-        "hours_since_last_transaction", "declined_transactions_30d",
-        "is_vpn_used", "hour_of_day", "day_of_week",
-    ]
-
-    FEATURE_COLS = CATEGORICAL_COLS + NUMERIC_COLS
-
-    CUSTOMER_FEATURES_TABLE = "mlops.siva_borusu.customer_features"
-    WAREHOUSE_ID = "960eea0736a2e75b"
+    SERVING_FEATURES_TABLE = SERVING_FEATURES_FQ
+    WAREHOUSE_ID = CFG.sql_warehouse_id
 
     def load_context(self, context):
-        """Load the inner model and customer features from Delta table."""
+        """Load the inner model and advisor features from Delta table."""
         self.model = mlflow.sklearn.load_model(context.artifacts["sklearn_model"])
-        self._load_customer_features()
+        self._load_serving_features()
 
-    def _load_customer_features(self):
-        """Load customer features using Databricks SDK with OAuth M2M auto-auth.
+    def _load_serving_features(self):
+        """Load serving features using Databricks SDK with OAuth M2M auto-auth.
 
         No manual env vars needed — the serving endpoint provisions credentials
         automatically via the model's declared resources (DatabricksSQLWarehouse
@@ -86,48 +81,64 @@ class FraudModelWrapper(mlflow.pyfunc.PythonModel):
         w = WorkspaceClient()
         stmt = w.statement_execution.execute_statement(
             warehouse_id=self.WAREHOUSE_ID,
-            statement=f"SELECT * FROM {self.CUSTOMER_FEATURES_TABLE}",
+            statement=f"SELECT * FROM {self.SERVING_FEATURES_TABLE}",
             wait_timeout="30s",
         )
 
-        # Build DataFrame and cast types from the response
         cols = [c.name for c in stmt.manifest.schema.columns]
         col_types = {c.name: c.type_name for c in stmt.manifest.schema.columns}
-        self.customer_features = pd.DataFrame(stmt.result.data_array, columns=cols)
+        self.serving_features = pd.DataFrame(stmt.result.data_array, columns=cols)
+
+        # Guard: Statement Execution API caps at 100K rows
+        if stmt.manifest.truncated:
+            raise RuntimeError(
+                f"Serving features table truncated at {len(self.serving_features)} rows. "
+                f"Increase warehouse result limit or pre-filter the table."
+            )
 
         for name, dtype in col_types.items():
             if dtype in ("DOUBLE", "FLOAT", "DECIMAL"):
-                self.customer_features[name] = pd.to_numeric(
-                    self.customer_features[name], errors="coerce"
+                self.serving_features[name] = pd.to_numeric(
+                    self.serving_features[name], errors="coerce"
                 )
             elif dtype in ("INT", "LONG", "SHORT", "BIGINT", "TINYINT", "SMALLINT"):
-                self.customer_features[name] = pd.to_numeric(
-                    self.customer_features[name], errors="coerce"
+                self.serving_features[name] = pd.to_numeric(
+                    self.serving_features[name], errors="coerce"
                 ).astype("Int64")
 
     def predict(self, context, model_input, params=None):
-        """Look up features, compute time features, and predict."""
+        """Look up features by Salesforce_Id__c and predict."""
+        import logging
+        _logger = logging.getLogger("AdvisorRiskWrapper")
+
         df = model_input.copy()
 
-        # Compute time features from transaction_timestamp
-        ts = pd.to_datetime(df["transaction_timestamp"])
-        df["hour_of_day"] = ts.dt.hour
-        df["day_of_week"] = ts.dt.dayofweek
-        df["is_vpn_used"] = df["is_vpn_used"].astype(int)
+        # Join advisor features by Salesforce_Id__c
+        df = df.merge(self.serving_features, on="Salesforce_Id__c", how="left")
 
-        # Look up customer features by card_id
-        df = df.merge(self.customer_features, on="card_id", how="left")
+        # Warn on unknown advisor IDs (imputer will fill NaNs with training medians)
+        unknown_mask = df[FEATURE_COLS].isna().all(axis=1)
+        if unknown_mask.any():
+            unknown_ids = model_input.loc[unknown_mask, "Salesforce_Id__c"].tolist()
+            _logger.warning(f"Unknown advisor IDs (features imputed with medians): {unknown_ids}")
 
-        # Select features in the expected order and predict
-        return self.model.predict(df[self.FEATURE_COLS])
+        # Predict class and probability
+        preds = self.model.predict(df[FEATURE_COLS])
+        probs = self.model.predict_proba(df[FEATURE_COLS])[:, 1]
+
+        return pd.DataFrame({
+            "Salesforce_Id__c": model_input["Salesforce_Id__c"],
+            "at_risk": preds,
+            "at_risk_probability": probs.round(4),
+        })
 
 # COMMAND ----------
 
-# DBTITLE 1,Log wrapper model
+# DBTITLE 1,Log and register wrapper model
 # MAGIC %md
 # MAGIC ## Log and Register Wrapper Model
-# MAGIC Load the champion model from UC, snapshot the customer features table,
-# MAGIC and log the pyfunc wrapper with both as artifacts.
+# MAGIC Load the champion model from UC, save as a local artifact, and log the pyfunc
+# MAGIC wrapper with declared resources for OAuth M2M auto-auth at serving time.
 
 # COMMAND ----------
 
@@ -137,32 +148,16 @@ from mlflow.models import ModelSignature
 from mlflow.types import Schema, ColSpec
 
 # Define the serving input/output signature
-input_schema = Schema([
-    ColSpec("string", "card_id"),
-    ColSpec("string", "transaction_timestamp"),
-    ColSpec("double", "transaction_amount"),
-    ColSpec("string", "transaction_country"),
-    ColSpec("string", "transaction_state"),
-    ColSpec("string", "merchant_category"),
-    ColSpec("string", "transaction_status"),
-    ColSpec("long", "is_vpn_used"),
+input_schema = Schema([ColSpec("string", "Salesforce_Id__c")])
+output_schema = Schema([
+    ColSpec("string", "Salesforce_Id__c"),
+    ColSpec("long", "at_risk"),
+    ColSpec("double", "at_risk_probability"),
 ])
-output_schema = Schema([ColSpec("long", "prediction")])
 signature = ModelSignature(inputs=input_schema, outputs=output_schema)
 
-# Input example — one raw transaction payload, exactly what a caller sends.
-# MLflow stores this alongside the model so the Serving UI "Query endpoint"
-# tab is pre-filled with a valid request body.
-input_example = pd.DataFrame([{
-    "card_id": "CC_0001",
-    "transaction_timestamp": "2026-09-30 03:15:00",
-    "transaction_amount": 2500.00,
-    "transaction_country": "US",
-    "transaction_state": "CA",
-    "merchant_category": "electronics",
-    "transaction_status": "approved",
-    "is_vpn_used": 1,
-}])
+# Input example — what a caller sends to the endpoint
+input_example = pd.DataFrame([{"Salesforce_Id__c": "0031I00000840aQAA"}])
 
 # Load the champion model from UC and save as local artifact
 champion_uri = CFG.champion_model_uri
@@ -178,81 +173,69 @@ from mlflow.models.resources import DatabricksSQLWarehouse, DatabricksTable
 
 resources = [
     DatabricksSQLWarehouse(warehouse_id=CFG.sql_warehouse_id),
-    DatabricksTable(table_name=CFG.fq_customer_features_table),
+    DatabricksTable(table_name=SERVING_FEATURES_FQ),
 ]
 
-# Log the pyfunc wrapper model — no parquet artifact,
-# customer features loaded from live Delta table at runtime
-with mlflow.start_run(run_name="fraud_pyfunc_wrapper") as run:
+# Log the pyfunc wrapper model — name from config
+
+with mlflow.start_run(run_name="advisor_risk_pyfunc_wrapper") as run:
     model_info = mlflow.pyfunc.log_model(
-        artifact_path="model",
-        python_model=FraudModelWrapper(),
+        name="model",
+        python_model=AdvisorRiskWrapper(),
         artifacts={"sklearn_model": inner_model_path},
-        registered_model_name=f"{CFG.catalog}.{CFG.schema}.fraud_model_credit_card_pyfunc",
+        registered_model_name=CFG.fq_pyfunc_model_name,
         signature=signature,
         input_example=input_example,
         resources=resources,
         pip_requirements=[
-            "mlflow", "lightgbm", "scikit-learn", "pandas", "pyarrow",
-            "databricks-sdk",
+            "mlflow==3.12.0",
+            "lightgbm==4.6.0",
+            "scikit-learn==1.7.2",
+            "pandas==2.3.3",
+            "pyarrow==21.0.0",
+            "databricks-sdk==0.108.0",
         ],
     )
-    # Copy training metrics from the inner sklearn model so downstream
-    # notebooks (evaluate.py, ab_test.py) can look up metrics by pyfunc version.
-    _sklearn_model = f"{CFG.catalog}.{CFG.schema}.{CFG.registered_model_name}"
-    try:
-        from mlflow.tracking import MlflowClient as _MC
-        _mc = _MC()
-        _inner_mv = _mc.get_model_version_by_alias(_sklearn_model, "champion")
-        _inner_metrics = _mc.get_run(_inner_mv.run_id).data.metrics
-        for k, v in _inner_metrics.items():
-            mlflow.log_metric(k, v)
-        logger.info(f"Copied {len(_inner_metrics)} training metrics from sklearn model v{_inner_mv.version}")
-    except Exception as e:
-        logger.warning(f"Could not copy training metrics: {e}")
-
     logger.info(f"Run ID: {run.info.run_id}")
-    logger.info(f"Wrapper model registered: {CFG.catalog}.{CFG.schema}.fraud_model_credit_card_pyfunc")
+    logger.info(f"Wrapper model registered: {CFG.fq_pyfunc_model_name}")
 
-# Always alias the newly registered version as @challenger
+# Alias the newly registered version as @challenger
 from mlflow.tracking import MlflowClient
 _client = MlflowClient()
-_pyfunc_model_name = f"{CFG.catalog}.{CFG.schema}.fraud_model_credit_card_pyfunc"
 _new_version = model_info.registered_model_version
-_client.set_registered_model_alias(_pyfunc_model_name, "challenger", _new_version)
-logger.info(f"Version {_new_version} aliased as @challenger")
+_client.set_registered_model_alias(CFG.fq_pyfunc_model_name, CFG.model_champion_alias, _new_version)
+logger.info(f"Version {_new_version} aliased as @{CFG.model_champion_alias}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Test wrapper
-# MAGIC %md
-# MAGIC ## Test Locally
-# MAGIC Test the predict logic directly using Spark for the feature lookup (notebook context).
-# MAGIC At serving time, `load_context` uses the Databricks SDK with OAuth M2M auto-auth.
+# DBTITLE 1,Register challenger version (demo bootstrap)
+# Re-log the same wrapper as a second version and alias it @challenger.
+# This gives us both aliases from day one so A/B test / evaluate notebooks work.
+# The client replaces the challenger with a genuinely different model later.
+with mlflow.start_run(run_name="advisor_risk_pyfunc_challenger") as challenger_run:
+    challenger_info = mlflow.pyfunc.log_model(
+        name="model",
+        python_model=AdvisorRiskWrapper(),
+        artifacts={"sklearn_model": inner_model_path},
+        registered_model_name=CFG.fq_pyfunc_model_name,
+        signature=signature,
+        input_example=input_example,
+        resources=resources,
+        pip_requirements=[
+            "mlflow==3.12.0",
+            "lightgbm==4.6.0",
+            "scikit-learn==1.7.2",
+            "pandas==2.3.3",
+            "pyarrow==21.0.0",
+            "databricks-sdk==0.108.0",
+        ],
+    )
 
-# COMMAND ----------
-
-# DBTITLE 1,Test with sample input
-# Test the wrapper directly (SQL connector not needed in notebook context)
-wrapper = FraudModelWrapper()
-wrapper.model = inner_model
-wrapper.customer_features = spark.table(CFG.fq_customer_features_table).toPandas()
-
-# Sample transaction payload — what the caller would send
-test_payload = pd.DataFrame([{
-    "card_id": "CC_0001",
-    "transaction_timestamp": "2026-09-30 03:15:00",
-    "transaction_amount": 2500.00,
-    "transaction_country": "US",
-    "transaction_state": "CA",
-    "merchant_category": "electronics",
-    "transaction_status": "approved",
-    "is_vpn_used": 1,
-}])
-
-prediction = wrapper.predict(None, test_payload)
-logger.info(f"Payload: card_id=CC_0001, amount=2500, VPN=True, 3AM electronics purchase")
-logger.info(f"Prediction: {'FRAUD' if prediction[0] == 1 else 'LEGIT'} ({prediction[0]})")
+_challenger_version = challenger_info.registered_model_version
+_client.set_registered_model_alias(
+    CFG.fq_pyfunc_model_name, CFG.model_challenger_alias, _challenger_version
+)
+logger.info(f"Version {_challenger_version} aliased as @{CFG.model_challenger_alias}")
 
 # COMMAND ----------
 
@@ -260,34 +243,14 @@ logger.info(f"Prediction: {'FRAUD' if prediction[0] == 1 else 'LEGIT'} ({predict
 # MAGIC %md
 # MAGIC ## Endpoint Request Format
 # MAGIC The signature is a column-based schema, so the model expects a **pandas DataFrame**. Model Serving
-# MAGIC accepts it as `dataframe_records` (list of row dicts) or `dataframe_split` (columns + data). A bare
-# MAGIC dict like the one above is **not** a valid body — it has to be wrapped.
+# MAGIC accepts it as `dataframe_records` (list of row dicts) or `dataframe_split` (columns + data).
 # MAGIC
-# MAGIC **Preferred — `dataframe_records`:** two rows for contrast — a 3 AM $2,500 electronics purchase
-# MAGIC over VPN (should lean fraud) and a mid-day $43 grocery run (should lean legit).
+# MAGIC **Preferred — `dataframe_records`:** score two advisors in one call.
 # MAGIC ```json
 # MAGIC {
 # MAGIC   "dataframe_records": [
-# MAGIC     {
-# MAGIC       "card_id": "CC_0001",
-# MAGIC       "transaction_timestamp": "2026-09-30 03:15:00",
-# MAGIC       "transaction_amount": 2500.0,
-# MAGIC       "transaction_country": "US",
-# MAGIC       "transaction_state": "CA",
-# MAGIC       "merchant_category": "electronics",
-# MAGIC       "transaction_status": "approved",
-# MAGIC       "is_vpn_used": 1
-# MAGIC     },
-# MAGIC     {
-# MAGIC       "card_id": "CC_0002",
-# MAGIC       "transaction_timestamp": "2026-09-30 13:40:00",
-# MAGIC       "transaction_amount": 42.75,
-# MAGIC       "transaction_country": "US",
-# MAGIC       "transaction_state": "CA",
-# MAGIC       "merchant_category": "grocery",
-# MAGIC       "transaction_status": "approved",
-# MAGIC       "is_vpn_used": 0
-# MAGIC     }
+# MAGIC     {"Salesforce_Id__c": "0031I00000840aQAA"},
+# MAGIC     {"Salesforce_Id__c": "0031I00000841bRAB"}
 # MAGIC   ]
 # MAGIC }
 # MAGIC ```
@@ -296,20 +259,39 @@ logger.info(f"Prediction: {'FRAUD' if prediction[0] == 1 else 'LEGIT'} ({predict
 # MAGIC ```json
 # MAGIC {
 # MAGIC   "dataframe_split": {
-# MAGIC     "columns": ["card_id", "transaction_timestamp", "transaction_amount", "transaction_country",
-# MAGIC                 "transaction_state", "merchant_category", "transaction_status", "is_vpn_used"],
-# MAGIC     "data": [["CC_0001", "2026-09-30 03:15:00", 2500.0, "US", "CA", "electronics", "approved", 1]]
+# MAGIC     "columns": ["Salesforce_Id__c"],
+# MAGIC     "data": [["0031I00000840aQAA"], ["0031I00000841bRAB"]]
 # MAGIC   }
 # MAGIC }
 # MAGIC ```
 # MAGIC
-# MAGIC **Response:** one element per input row, in the same order.
+# MAGIC **Response:** one row per input advisor, in the same order.
 # MAGIC ```json
-# MAGIC {"predictions": [1, 0]}
+# MAGIC {
+# MAGIC   "predictions": [
+# MAGIC     {"Salesforce_Id__c": "0031I00000840aQAA", "at_risk": 0, "at_risk_probability": 0.0312},
+# MAGIC     {"Salesforce_Id__c": "0031I00000841bRAB", "at_risk": 1, "at_risk_probability": 0.8741}
+# MAGIC   ]
+# MAGIC }
 # MAGIC ```
 # MAGIC
 # MAGIC Notes:
+# MAGIC * Send **only** `Salesforce_Id__c` — all 14 features are looked up server-side.
 # MAGIC * Add or remove dicts in `dataframe_records` to score a batch in one call.
-# MAGIC * `is_vpn_used` must be an integer (`0`/`1`), not `true`/`false` — the signature declares it `long`.
-# MAGIC * `transaction_timestamp` is a string; `pd.to_datetime` parses it inside `predict`.
-# MAGIC * Send **only** these 8 fields — customer features are looked up server-side by `card_id`.
+# MAGIC * Unknown advisor IDs will return NaN features and an unpredictable score.
+
+# COMMAND ----------
+
+# DBTITLE 1,Test locally
+# Test the wrapper directly (notebook context — no SDK call needed)
+wrapper = AdvisorRiskWrapper()
+wrapper.model = inner_model
+wrapper.serving_features = spark.table(SERVING_FEATURES_FQ).toPandas()
+
+# Pick two real advisor IDs from the table
+sample_ids = wrapper.serving_features["Salesforce_Id__c"].head(2).tolist()
+test_payload = pd.DataFrame({"Salesforce_Id__c": sample_ids})
+
+result = wrapper.predict(None, test_payload)
+logger.info(f"Test predictions:\n{result.to_string(index=False)}")
+display(result)

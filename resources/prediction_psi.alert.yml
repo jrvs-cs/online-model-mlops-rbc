@@ -1,11 +1,11 @@
 # Prediction distribution shift (PSI) alert.
-# Fires when the prediction column's PSI exceeds 0.2 vs baseline.
+# Fires when the at_risk prediction column's PSI exceeds 0.2 vs baseline.
 # Source: Lakehouse Monitor output table _drift_metrics.
 # Schedule: daily at 08:30 ET (30 min after the monitor's 08:00 refresh).
 resources:
   alerts:
     prediction_psi_alert:
-      display_name: "[${bundle.target}] Fraud Model - Prediction PSI Shift"
+      display_name: "[${bundle.target}] Advisor Risk - Prediction PSI Shift"
       query_text: |
         SELECT
           window.start  AS window_start,
@@ -13,7 +13,7 @@ resources:
           granularity,
           population_stability_index AS psi,
           wasserstein_distance
-        FROM ${var.catalog}.${var.schema}.customer_n_transactions_drift_drift_metrics
+        FROM ${var.catalog}.${var.schema}.${var.drift_table}_drift_metrics
         WHERE drift_type = 'BASELINE'
           AND column_name = 'prediction'
           AND slice_key IS NULL

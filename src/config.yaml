@@ -1,0 +1,43 @@
+# ── Advisor Risk Scoring MLOps — Project Configuration ─────────────
+# Change catalog + schema to point at your environment.
+# Table names stay the same across environments.
+
+# ── Unity Catalog coordinates ──────────────────────────────────────
+# Dev / demo environment
+catalog: mlops
+schema: siva_borusu
+
+# Client environment (uncomment below, comment out above)
+# catalog: t1u0_n_gamdna_gold
+# schema: es_advisor_360
+
+# ── Source tables (identical in every environment) ─────────────────
+tables:
+  book_profile: book_profile_360
+  tools_adoption: tools_adoption_360
+  advisor_holdings: advisor_holdings_360
+  training: advisor_risk_features
+  serving_features: advisor_serving_features
+  drift: advisor_risk_features_drift
+
+# ── Model ──────────────────────────────────────────────────────────
+model:
+  registered_name: advisor_risk_model
+  pyfunc_registered_name: advisor_risk_model_pyfunc
+  experiment_name: /Shared/advisor-risk-experiment
+  champion_alias: champion
+  challenger_alias: challenger
+
+# ── Serving ────────────────────────────────────────────────────────
+serving:
+  endpoint_name: advisor-risk-model
+  workload_size: Small
+  scale_to_zero: true
+  sql_warehouse_id: 960eea0736a2e75b
+
+# ── Monitoring / Alerts ────────────────────────────────────────────
+monitoring:
+  drift_threshold_psi: 0.2
+  drift_threshold_ks: 0.05
+  alert_email_recipients:
+    - siva.borusu@jrvs.ca

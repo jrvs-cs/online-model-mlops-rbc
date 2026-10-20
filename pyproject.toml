@@ -1,5 +1,5 @@
 [project]
-name = "fraud-model-mlops"
+name = "advisor-risk-mlops"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -7,7 +7,7 @@ requires-python = ">=3.14"
 dependencies = []
 
 [project.scripts]
-fraud-model-mlops = "fraud_model_mlops:main"
+advisor-risk-mlops = "advisor_risk_mlops:main"
 
 [build-system]
 requires = ["uv_build>=0.12.21,<0.13.0"]

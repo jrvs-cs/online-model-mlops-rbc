@@ -1,0 +1,34 @@
+# Lakehouse Quality Monitor — Advisor Risk Drift Detection
+# Deployed declaratively via DABs. No setup notebook needed.
+#
+# Creates a Quality Monitor (InferenceLog type) on the drift table.
+# Compares against the training baseline for feature/prediction drift.
+# Outputs _profile_metrics and _drift_metrics tables that the three
+# DABs-managed SQL alerts query for automated notifications.
+#
+# Deploy:  databricks bundle deploy --target <target>
+# The monitor's own daily schedule (08:00 ET) handles ongoing refreshes.
+resources:
+  quality_monitors:
+    advisor_drift_monitor:
+      table_name: ${var.catalog}.${var.schema}.${var.drift_table}
+      assets_dir: /Workspace/Shared/advisor-risk-mlops/monitoring_assets
+      output_schema_name: ${var.catalog}.${var.schema}
+      baseline_table_name: ${var.catalog}.${var.schema}.${var.training_table}
+      warehouse_id: ${var.warehouse_id}
+
+      inference_log:
+        granularities:
+          - "1 day"
+          - "1 week"
+        model_id_col: "model_version"
+        prediction_col: "prediction"
+        label_col: "at_risk"
+        timestamp_col: "scored_at"
+        problem_type: "PROBLEM_TYPE_CLASSIFICATION"
+
+      schedule:
+        quartz_cron_expression: "0 0 8 * * ?"
+        timezone_id: "America/Toronto"
+
+      slicing_exprs: []

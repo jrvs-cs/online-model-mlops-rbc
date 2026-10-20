@@ -6,7 +6,7 @@
 resources:
   alerts:
     feature_drift_alert:
-      display_name: "[${bundle.target}] Fraud Model - Feature Drift vs Baseline"
+      display_name: "[${bundle.target}] Advisor Risk - Feature Drift vs Baseline"
       query_text: |
         SELECT
           window.start   AS window_start,
@@ -17,10 +17,10 @@ resources:
           ks_test.pvalue              AS ks_pvalue,
           chi_squared_test.statistic  AS chi2_statistic,
           chi_squared_test.pvalue     AS chi2_pvalue
-        FROM ${var.catalog}.${var.schema}.customer_n_transactions_drift_drift_metrics
+        FROM ${var.catalog}.${var.schema}.${var.drift_table}_drift_metrics
         WHERE drift_type = 'BASELINE'
           AND slice_key IS NULL
-          AND column_name NOT IN ('prediction', ':table')
+          AND column_name NOT IN ('at_risk', ':table')
           AND window.start >= current_date() - INTERVAL 1 DAY
           AND (
             ks_test.pvalue < 0.05
