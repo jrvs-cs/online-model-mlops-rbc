@@ -1,5 +1,5 @@
 {
-  "name": "fraud-model-warehouse",
+  "name": "advisor-risk-warehouse",
   "cluster_size": "2X-Small",
   "min_num_clusters": 1,
   "max_num_clusters": 1,
@@ -11,7 +11,7 @@
   },
   "tags": {
     "custom_tags": [
-      {"key": "project", "value": "fraud-model-mlops"},
+      {"key": "project", "value": "advisor-risk-mlops"},
       {"key": "team", "value": "data-science"}
     ]
   }

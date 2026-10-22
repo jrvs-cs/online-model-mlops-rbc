@@ -1,7 +1,10 @@
 # Retraining pipeline — runs AFTER a champion model is already registered.
-# Initial model development is interactive (use notebooks/eda + src/models/train).
-# This job retrains on fresh data, evaluates against the sitting champion,
-# auto-promotes if better, and redeploys the endpoint.
+# Initial model development is interactive (run the README Quick Start steps,
+# incl. src/models/experimentation_optuna_mlflow_tracking).
+# This job rebuilds features, re-tunes + retrains on fresh data (evaluation
+# happens inside training via Optuna CV + held-out test metrics), registers the
+# best model as @challenger, wraps it as pyfunc, and redeploys the endpoint
+# (50/50 champion/challenger). Promotion to @champion is decided by the A/B test.
 #
 # Schedule: weekly Monday 06:00 ET, or triggered by drift alerts via webhook.
 # Source: Git — jobs checkout ${var.git_branch} at runtime (dev or main).
@@ -12,15 +15,19 @@ resources:
 
       # ── Git source — checkout the target branch at runtime ───────
       git_source:
-        git_url: https://github.com/siva-borusu-jrvs/fraud-model-mlops.git
+        git_url: https://github.com/jrvs-cs/online-model-mlops-rbc.git
         git_provider: gitHub
         git_branch: ${var.git_branch}
 
-      # ── Shared job cluster (ML Runtime for lightgbm + mlflow) ────
+      # ── Shared job cluster (ML Runtime for lightgbm + mlflow + optuna) ──
+      # Same runtime as the interactive cluster so the pyfunc pip pins
+      # (mlflow / scikit-learn / lightgbm) match the training environment.
       job_clusters:
         - job_cluster_key: ml_cluster
           new_cluster:
-            spark_version: "15.4.x-cpu-ml-scala2.12"
+            kind: CLASSIC_PREVIEW
+            spark_version: "19.x-scala2.13"
+            use_ml_runtime: true
             node_type_id: "Standard_DS3_v2"
             num_workers: 1
             data_security_mode: "SINGLE_USER"
@@ -38,13 +45,30 @@ resources:
           default: ${var.model_name}
         - name: endpoint_name
           default: ${var.endpoint_name}
+        # Alias given to the newly trained model (train + pyfunc_wrapper).
+        # Retraining always registers a challenger; promotion happens in the A/B test.
+        - name: model_alias
+          default: challenger
+        # deploy.py: retraining -> add @challenger next to the serving champion (50/50).
+        # Manual runs default to training -> @champion only (100%).
+        - name: run_type
+          default: retraining
 
       tasks:
-        # ── Model training + evaluation ───────────────────────────
-        - task_key: train
+        # ── Feature engineering (training table + serving lookup table) ──
+        - task_key: build_features
           job_cluster_key: ml_cluster
           notebook_task:
-            notebook_path: src/models/train.py
+            notebook_path: src/feature_engineering/build_features
+            source: GIT
+
+        # ── Model training (Optuna tuning + register best) + evaluation ──
+        - task_key: train
+          depends_on:
+            - task_key: build_features
+          job_cluster_key: ml_cluster
+          notebook_task:
+            notebook_path: src/models/experimentation_optuna_mlflow_tracking
             source: GIT
 
         - task_key: pyfunc_wrapper
@@ -55,18 +79,10 @@ resources:
             notebook_path: src/models/pyfunc_wrapper.py
             source: GIT
 
-        - task_key: evaluate
-          depends_on:
-            - task_key: pyfunc_wrapper
-          job_cluster_key: ml_cluster
-          notebook_task:
-            notebook_path: src/models/evaluate.py
-            source: GIT
-
         # ── Deployment ────────────────────────────────────────────
         - task_key: deploy
           depends_on:
-            - task_key: evaluate
+            - task_key: pyfunc_wrapper
           job_cluster_key: ml_cluster
           notebook_task:
             notebook_path: src/serving/deploy.py

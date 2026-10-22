@@ -3,8 +3,9 @@
 Usage:
     from src.utils import read_table, write_table
 
-    df = read_table("mlops.siva_borusu.transactions")
-    write_table(df, "mlops.siva_borusu.predictions")
+    from src.config import CFG
+    df = read_table(CFG.fq("training"))
+    write_table(df, "<catalog>.<schema>.<table>")
 """
 
 from pyspark.sql import DataFrame, SparkSession

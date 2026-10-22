@@ -1,22 +1,31 @@
 {
-  "name": "fraud-classifier-endpoint",
+  "name": "advisor-risk-model",
   "config": {
     "served_entities": [
       {
-        "entity_name": "ml.fraud.fraud_classifier",
+        "name": "champion",
+        "entity_name": "mlops.siva_borusu.advisor_risk_model_pyfunc",
         "entity_version": null,
         "workload_size": "Small",
         "scale_to_zero_enabled": true
       }
     ],
-    "auto_capture_config": {
-      "catalog_name": "ml",
-      "schema_name": "fraud",
-      "enabled": true
+    "traffic_config": {
+      "routes": [
+        {"served_model_name": "champion", "traffic_percentage": 100}
+      ]
     }
   },
+  "ai_gateway": {
+    "inference_table_config": {
+      "catalog_name": "mlops",
+      "schema_name": "siva_borusu",
+      "enabled": true
+    },
+    "usage_tracking_config": {"enabled": true}
+  },
   "tags": [
-    {"key": "project", "value": "fraud-model-mlops"},
+    {"key": "project", "value": "advisor-risk-mlops"},
     {"key": "env", "value": "production"}
   ]
 }

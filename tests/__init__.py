@@ -1,1 +1,1 @@
-"""Fraud model test suite."""
+"""Advisor risk model test suite."""

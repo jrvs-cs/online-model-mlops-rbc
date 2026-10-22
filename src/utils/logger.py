@@ -1,4 +1,4 @@
-"""Centralized logging for the fraud-model-mlops project.
+"""Centralized logging for the advisor-risk-mlops project.
 
 Usage:
     from src.utils import get_logger

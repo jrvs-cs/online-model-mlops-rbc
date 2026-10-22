@@ -52,6 +52,7 @@ class ProjectConfig:
     training_table: str = _raw["tables"]["training"]
     serving_features_table: str = _raw["tables"]["serving_features"]
     drift_table: str = _raw["tables"]["drift"]
+    evaluation_table: str = _raw["tables"]["evaluation"]
 
     # ── Model ──────────────────────────────────────────────────────
     registered_model_name: str = _raw["model"]["registered_name"]

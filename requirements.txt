@@ -1,4 +1,4 @@
-# Fraud Model MLOps - Python Dependencies
+# Advisor Risk MLOps - Python Dependencies
 # Pre-installed on Databricks ML Runtime: mlflow, sklearn, pyspark, numpy, pandas
 # Add only packages NOT in the runtime.
 

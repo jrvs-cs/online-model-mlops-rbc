@@ -8,7 +8,7 @@
 
 # COMMAND ----------
 
-# DBTITLE 1,Imports and setup
+# DBTITLE 1,Imports, setup, and alias parameter
 import mlflow
 import mlflow.sklearn
 import mlflow.pyfunc
@@ -22,6 +22,15 @@ mlflow.set_experiment(CFG.experiment_name)
 
 # Fully-qualified serving features table
 SERVING_FEATURES_FQ = CFG.fq("serving_features")
+
+# ── Alias to wrap + assign (must match the alias used in training; job parameter overrides widget) ──
+dbutils.widgets.text("model_alias", CFG.model_challenger_alias)
+MODEL_ALIAS = dbutils.widgets.get("model_alias").strip().lower()
+
+ALLOWED_ALIASES = {CFG.model_champion_alias, CFG.model_challenger_alias}
+if MODEL_ALIAS not in ALLOWED_ALIASES:
+    raise ValueError(f"model_alias must be one of {sorted(ALLOWED_ALIASES)}, got '{MODEL_ALIAS}'")
+logger.info(f"Wrapping sklearn model @{MODEL_ALIAS}")
 
 # COMMAND ----------
 
@@ -137,12 +146,13 @@ class AdvisorRiskWrapper(mlflow.pyfunc.PythonModel):
 # DBTITLE 1,Log and register wrapper model
 # MAGIC %md
 # MAGIC ## Log and Register Wrapper Model
-# MAGIC Load the champion model from UC, save as a local artifact, and log the pyfunc
-# MAGIC wrapper with declared resources for OAuth M2M auto-auth at serving time.
+# MAGIC Load the sklearn model at `@{model_alias}` from UC, save it as a local artifact, and log the pyfunc
+# MAGIC wrapper with declared resources for OAuth M2M auto-auth at serving time. The new pyfunc version gets
+# MAGIC the same alias. Bootstrap: if the pyfunc model has no `@champion` yet, it gets both `@champion` and `@challenger`.
 
 # COMMAND ----------
 
-# DBTITLE 1,Save artifacts and log pyfunc
+# DBTITLE 1,Save artifacts, log pyfunc, and assign alias
 import tempfile, os
 from mlflow.models import ModelSignature
 from mlflow.types import Schema, ColSpec
@@ -159,10 +169,10 @@ signature = ModelSignature(inputs=input_schema, outputs=output_schema)
 # Input example — what a caller sends to the endpoint
 input_example = pd.DataFrame([{"Salesforce_Id__c": "0031I00000840aQAA"}])
 
-# Load the champion model from UC and save as local artifact
-champion_uri = CFG.champion_model_uri
-logger.info(f"Loading inner model from: {champion_uri}")
-inner_model = mlflow.sklearn.load_model(champion_uri)
+# Load the sklearn model at the requested alias from UC and save as local artifact
+inner_model_uri = f"models:/{CFG.fq_model_name}@{MODEL_ALIAS}"
+logger.info(f"Loading inner model from: {inner_model_uri}")
+inner_model = mlflow.sklearn.load_model(inner_model_uri)
 
 tmp_dir = tempfile.mkdtemp()
 inner_model_path = os.path.join(tmp_dir, "sklearn_model")
@@ -178,7 +188,8 @@ resources = [
 
 # Log the pyfunc wrapper model — name from config
 
-with mlflow.start_run(run_name="advisor_risk_pyfunc_wrapper") as run:
+with mlflow.start_run(run_name=f"advisor_risk_pyfunc_{MODEL_ALIAS}") as run:
+    mlflow.set_tag("inner_model_uri", inner_model_uri)
     model_info = mlflow.pyfunc.log_model(
         name="model",
         python_model=AdvisorRiskWrapper(),
@@ -199,43 +210,31 @@ with mlflow.start_run(run_name="advisor_risk_pyfunc_wrapper") as run:
     logger.info(f"Run ID: {run.info.run_id}")
     logger.info(f"Wrapper model registered: {CFG.fq_pyfunc_model_name}")
 
-# Alias the newly registered version as @challenger
+# Alias the newly registered pyfunc version (same alias as the inner sklearn model)
 from mlflow.tracking import MlflowClient
-_client = MlflowClient()
-_new_version = model_info.registered_model_version
-_client.set_registered_model_alias(CFG.fq_pyfunc_model_name, CFG.model_champion_alias, _new_version)
-logger.info(f"Version {_new_version} aliased as @{CFG.model_champion_alias}")
+client = MlflowClient()
+new_version = model_info.registered_model_version
 
-# COMMAND ----------
 
-# DBTITLE 1,Register challenger version (demo bootstrap)
-# Re-log the same wrapper as a second version and alias it @challenger.
-# This gives us both aliases from day one so A/B test / evaluate notebooks work.
-# The client replaces the challenger with a genuinely different model later.
-with mlflow.start_run(run_name="advisor_risk_pyfunc_challenger") as challenger_run:
-    challenger_info = mlflow.pyfunc.log_model(
-        name="model",
-        python_model=AdvisorRiskWrapper(),
-        artifacts={"sklearn_model": inner_model_path},
-        registered_model_name=CFG.fq_pyfunc_model_name,
-        signature=signature,
-        input_example=input_example,
-        resources=resources,
-        pip_requirements=[
-            "mlflow==3.12.0",
-            "lightgbm==4.6.0",
-            "scikit-learn==1.7.2",
-            "pandas==2.3.3",
-            "pyarrow==21.0.0",
-            "databricks-sdk==0.108.0",
-        ],
-    )
+def alias_exists(model_name: str, alias: str) -> bool:
+    """True if the alias is currently set on any version of the model."""
+    try:
+        client.get_model_version_by_alias(model_name, alias)
+        return True
+    except Exception:
+        return False
 
-_challenger_version = challenger_info.registered_model_version
-_client.set_registered_model_alias(
-    CFG.fq_pyfunc_model_name, CFG.model_challenger_alias, _challenger_version
-)
-logger.info(f"Version {_challenger_version} aliased as @{CFG.model_challenger_alias}")
+
+# Bootstrap: no pyfunc @champion yet -> set both aliases so deploy / A/B can resolve both
+if not alias_exists(CFG.fq_pyfunc_model_name, CFG.model_champion_alias):
+    aliases_to_set = [CFG.model_champion_alias, CFG.model_challenger_alias]
+    logger.info(f"No pyfunc @{CFG.model_champion_alias} found — bootstrapping version {new_version} as both aliases")
+else:
+    aliases_to_set = [MODEL_ALIAS]
+
+for alias in aliases_to_set:
+    client.set_registered_model_alias(CFG.fq_pyfunc_model_name, alias, new_version)
+    logger.info(f"{CFG.fq_pyfunc_model_name} version {new_version} aliased as @{alias}")
 
 # COMMAND ----------
 
