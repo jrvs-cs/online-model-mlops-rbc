@@ -30,9 +30,9 @@ variables:
   monitored_table:
     description: Inference log table monitored for drift / model quality (without catalog.schema prefix) — same as tables.evaluation in config.yaml
     default: advisor_risk_evaluation
-  training_table:
-    description: Training features table name (without catalog.schema prefix)
-    default: advisor_risk_features
+  baseline_table:
+    description: Quality monitor baseline table (training data scored by the trained model; same as tables.baseline in config.yaml)
+    default: advisor_risk_baseline
   warehouse_id:
     description: SQL warehouse ID for alerts and monitoring queries
   git_branch:

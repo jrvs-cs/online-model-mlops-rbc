@@ -18,6 +18,10 @@ tables:
   advisor_holdings: advisor_holdings_360
   training: advisor_risk_features
   serving_features: advisor_serving_features
+  # Quality monitor baseline: training data scored by the newly trained model
+  # (features + at_risk + prediction + model_version). Written by experimentation_optuna_mlflow_tracking.
+  # Must match var.baseline_table in databricks.yml.
+  baseline: advisor_risk_baseline
   # Inference logs joined with actual labels (features + served model + prediction + at_risk).
   # Populated by a data engineering process in production; seeded by notebooks/synthetic_inference_logs for the demo (run after deploy).
   # Used by the Quality Monitor (drift + model quality, baseline = training table) and by

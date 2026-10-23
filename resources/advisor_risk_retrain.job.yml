@@ -9,7 +9,9 @@
 # best model as @challenger, wraps it as pyfunc, and redeploys the endpoint
 # (50/50 champion/challenger). Promotion to @champion is decided by the A/B test.
 #
-# Schedule: weekly Monday 06:00 ET, or triggered by drift alerts via webhook.
+# Drift-gated: check_drift (same logic as feature_drift.alert.yml) -> retrain_needed
+# (condition task) -> retraining tasks run only if drift was found or force_retrain=true.
+# Schedule: weekly Monday 06:00 ET.
 # Source: Git — jobs checkout ${var.git_branch} at runtime (dev or main).
 resources:
   jobs:
@@ -59,10 +61,34 @@ resources:
         # Manual runs default to training -> @champion only (100%).
         - name: run_type
           default: retraining
+        # Drift gate (check_drift): "true" skips the drift check and always retrains (manual runs).
+        - name: force_retrain
+          default: "false"
+        # Drift gate: how many days of _drift_metrics windows to check (job runs weekly).
+        - name: drift_lookback_days
+          default: "7"
 
       tasks:
+        # ── Drift gate: same check as feature_drift.alert.yml → task value `retrain` ──
+        - task_key: check_drift
+          job_cluster_key: ml_cluster
+          notebook_task:
+            notebook_path: src/monitoring/check_drift
+            source: GIT
+
+        - task_key: retrain_needed
+          depends_on:
+            - task_key: check_drift
+          condition_task:
+            left: "{{tasks.check_drift.values.retrain}}"
+            op: EQUAL_TO
+            right: "true"
+
         # ── Feature engineering (training table + serving lookup table) ──
         - task_key: build_features
+          depends_on:
+            - task_key: retrain_needed
+              outcome: "true"
           job_cluster_key: ml_cluster
           notebook_task:
             notebook_path: src/feature_engineering/build_features
