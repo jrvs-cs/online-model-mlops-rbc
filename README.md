@@ -8,33 +8,111 @@ stays the same.
 
 ---
 
+## Prerequisites — Access & Permissions
+
+Set these up **before** step 1. "Run identity" = the user or service principal (SPN) the jobs run as
+(`run_as` — dev: the deploying user; prod: `siva.borusu@jrvs.ca` in `databricks.yml`).
+
+**Branches:** `dev` is for development, `main` is for production.
+
+| Branch | Purpose | Bundle target | Jobs check out | Catalog / endpoint |
+| --- | --- | --- | --- | --- |
+| `dev` | Development — all changes are made and tested here first | `dev` | `dev` | `mlops` / `advisor-risk-model` |
+| `main` | Production — only receives tested changes merged from `dev` (pull request) | `prod` | `main` | `mlops_prod` / `advisor-risk-model-prod` |
+
+CI (`.github/workflows/ci.yml`) runs the checks on every push / pull request; the deploy step runs only
+when triggered manually from `main`.
+
+| Area | What is needed | Who needs it | Used by |
+| --- | --- | --- | --- |
+| **Databricks CLI connection** | Databricks CLI (recent version with `bundle` commands) authenticated to `https://adb-5944275879339631.11.azuredatabricks.net` — locally: `databricks auth login --host <workspace-url>` (OAuth), or use the workspace web terminal | Person running the steps | `bundle validate / deploy / summary / run`, monitor refresh |
+| **CI connection** (optional) | GitHub repo secret `DATABRICKS_TOKEN` (PAT), or for an SPN: `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` (OAuth M2M, needs a matching change in `.github/workflows/ci.yml`) | GitHub Actions | `ci.yml` validate + manual deploy |
+| **GitHub access for jobs** | A Git credential linked in Databricks for `https://github.com/jrvs-cs/online-model-mlops-rbc.git` (User Settings → Linked accounts → GitHub, PAT with repo read or GitHub App). Branches `dev` and `main` must exist on the remote | Run identity (an SPN needs its own Git credential) | Both jobs check out code from Git at runtime |
+| **GitHub access for the Git folder** | Git credential with **write** access to the repo | Person editing the workspace | Commit + push (step 8a) |
+| **Job clusters** | Permission to create clusters (unrestricted cluster creation, or a cluster policy that allows `Standard_DS3_v2`, DBR `19.x-scala2.13` ML, single user) | Run identity | `ml_cluster` in both jobs |
+| **Interactive cluster** | CAN ATTACH TO / CAN RESTART on an ML runtime cluster (DBR 19 ML) | Person running the notebooks | Steps 1–6, 9a |
+| **SQL warehouse** | CAN USE on warehouse `960eea0736a2e75b` | Run identity, alert owner, serving endpoint (auto-provisioned via the pyfunc's declared resources) | Feature lookup in the pyfunc, quality monitor, SQL alerts |
+| **Unity Catalog** | `USE CATALOG` on `mlops` (dev) / `mlops_prod` (prod); `USE SCHEMA`, `CREATE TABLE`, `CREATE MODEL` on `siva_borusu`; `SELECT` / `MODIFY` on its tables; owner or `MANAGE` on `advisor_risk_evaluation` to create the monitor. The prod catalog + schema must already exist | Person running the notebooks + run identity | Tables, registered models, monitor output tables, AI Gateway inference table |
+| **Model Serving** | Permission to create serving endpoints, and CAN MANAGE on `advisor-risk-model` / `advisor-risk-model-prod` | Person running step 5 + run identity | `deploy.py`, `ab_test.py` |
+| **MLflow** | CAN EDIT / CAN MANAGE on `/Shared/advisor-risk-experiment` (dev) and `/Shared/advisor-risk-experiment-prod` (prod) or the `/Shared` folder | Person running the notebooks + run identity | Training + pyfunc runs |
+| **Workspace folders** | Write access to `/Workspace/Shared/advisor-risk-mlops/dev/` and `/Workspace/Shared/advisor-risk-mlops-prod/` | Person deploying the bundle | Monitor dashboards |
+| **Email** | A valid address in `var.notify_email` | — | Job failure + alert notifications |
+
+**Using a service principal instead of a user (recommended for prod):**
+1. Create the SPN and grant it every "run identity" row above (UC grants, warehouse CAN USE, cluster
+   creation or a cluster policy, endpoint CAN MANAGE, experiment access).
+2. Create a Git credential **for the SPN** (Git credentials API, acting as the SPN) so the jobs can check out the repo.
+3. In `databricks.yml` change the prod `run_as` from `user_name: siva.borusu@jrvs.ca` to
+   `service_principal_name: <spn-application-id>` (whoever deploys needs the *Service Principal: User* role on it).
+4. For CI, authenticate as the SPN with `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` instead of a PAT.
+
+---
+
 ## End-to-End Demo Run (from scratch)
 
 **Compute:** run every notebook on an **ML runtime** cluster (DBR 19 ML, same as the job
 clusters). Serverless / non-ML clusters lack `lightgbm` / `optuna`.
 
-**Jobs run from Git:** both jobs check out `${var.git_branch}` (dev target → `dev`) from
+**Jobs run from Git:** both jobs check out `${var.git_branch}` (dev target → `dev`, prod → `main`) from
 GitHub. **Commit and push** the workspace changes before running a job, otherwise it runs old code.
+The `dev` branch must exist on the remote (first time: create `dev` from `main` in the Git folder UI and push it).
+
+**Fresh start assumed:** the steps assume no models, endpoint or bundle resources exist yet — e.g. step 3
+only bootstraps `@champion` + `@challenger` on v1 when the model has no `@champion`.
 
 | # | Step | Where | Result |
 | --- | --- | --- | --- |
 | 1 | `notebooks/synthetic_data` | notebook | 3 source tables (demo only) |
-| 2 | `src/feature_engineering/build_features` | notebook | training, serving-lookup and drift tables |
+| 2 | `src/feature_engineering/build_features` | notebook | training + serving-lookup tables |
 | 3 | `src/models/experimentation_optuna_mlflow_tracking` | notebook (`model_alias=challenger`) | `advisor_risk_model` v1 → `@champion` + `@challenger` (bootstrap) |
 | 4 | `src/models/pyfunc_wrapper.py` | notebook (`model_alias=challenger`) | `advisor_risk_model_pyfunc` v1 → `@champion` + `@challenger` (bootstrap) |
 | 5 | `src/serving/deploy.py` | notebook (`run_type=training`) | endpoint serving `@champion` at 100% + AI Gateway logging |
-| 6 | `databricks bundle deploy -t dev` | CLI | jobs, quality monitor, SQL alerts (needs the drift table from step 2) |
-| 7 | Retraining job (`bundle run advisor_risk_retrain -t dev`) | job | new `@challenger` version, endpoint 50/50 champion/challenger |
-| 8 | `notebooks/synthetic_inference_logs` | notebook | `advisor_risk_evaluation` — inference logs + actual labels (demo only) |
-| 9 | `src/serving/ab_test.py` (or `bundle run ab_test_resolution -t dev`) | notebook / job | test concluded: winner `@champion` at 100%, loser `archive_<ts>`, `@challenger` removed |
+| 6 | `notebooks/synthetic_inference_logs` (1st run) | notebook | `advisor_risk_evaluation` — inference logs + actual labels, 100% champion (demo only) |
+| 7a | `databricks bundle validate --strict -t dev` | CLI | config check only — nothing is created |
+| 7b | `databricks bundle deploy -t dev` | CLI | creates the 6 bundle resources listed below (needs the table from step 6); runs nothing |
+| 7c | `databricks bundle summary -t dev` | CLI | confirms the 6 resources exist and shows their URLs |
+| 8a | Commit + push to the `dev` branch (create it from `main` the first time) | Git folder UI | the jobs check out `dev` from GitHub at runtime |
+| 8b | `databricks bundle run advisor_risk_retrain -t dev` | CLI → job | `build_features` → `train` → `pyfunc_wrapper` → `deploy` (`run_type=retraining`): new `@challenger`, endpoint 50/50 |
+| 9a | `notebooks/synthetic_inference_logs` (2nd run) | notebook | inference logs split 50/50 between champion and challenger |
+| 9b | `databricks quality-monitors run-refresh mlops.siva_borusu.advisor_risk_evaluation` | CLI (or Catalog Explorer → table → **Quality** tab → **Refresh metrics**) | refreshes monitor metrics + dashboard now (otherwise daily 08:00 ET) |
+| 10 | `databricks bundle run ab_test_resolution -t dev` (or run `src/serving/ab_test.py` interactively) | CLI → job | test concluded: winner `@champion` at 100%, loser `archive_<ts>`, `@challenger` removed |
+
+Run the CLI commands from the bundle root (`online-model-mlops-rbc/`, where `databricks.yml` lives),
+with the Databricks CLI authenticated to this workspace.
+
+**What step 7b deploys** (`bundle deploy` always deploys the whole bundle — DABs cannot deploy a
+single resource — so these are exactly the pieces it creates or updates):
+
+| Resource key | File | Type | Created as | After deploy |
+| --- | --- | --- | --- | --- |
+| `advisor_risk_retrain` | `resources/advisor_risk_retrain.job.yml` | Job | `[dev <user>] [dev] Advisor Risk - Retrain` | schedule **paused** in dev mode; run manually (8b) |
+| `ab_test_resolution` | `resources/ab_test_resolution.job.yml` | Job | `[dev <user>] [dev] Advisor Risk - A/B Test Resolution` | schedule **paused** in dev mode; run manually (10) |
+| `advisor_drift_monitor` | `resources/advisor_drift.quality_monitor.yml` | Quality monitor | on `advisor_risk_evaluation` | first refresh starts automatically; creates the `_profile_metrics` / `_drift_metrics` tables and the dashboard in `/Workspace/Shared/advisor-risk-mlops/dev/monitoring_assets` |
+| `feature_drift_alert` | `resources/feature_drift.alert.yml` | SQL alert | `... Feature Drift vs Baseline` | evaluates daily 08:30 ET |
+| `model_quality_alert` | `resources/model_quality.alert.yml` | SQL alert | `... Quality Degradation` | evaluates daily 08:30 ET |
+| `prediction_psi_alert` | `resources/prediction_psi.alert.yml` | SQL alert | `... Prediction PSI Shift` | evaluates daily 08:30 ET |
+
+Nothing in steps 1–6 (tables, models, endpoint) is a bundle resource — those are created by the notebooks.
 
 Notes:
 - After steps 3–5 `@champion` and `@challenger` are the **same** version, so there is nothing to
-  compare yet. Step 7 creates a genuinely new challenger. Without pushing to Git, the same result can
+  compare yet. Step 8b creates a genuinely new challenger. Without pushing to Git (8a), the same result can
   be produced manually: re-run steps 3 → 4 (`model_alias=challenger`) → `deploy.py` with `run_type=retraining`.
-- Step 8 must run **after** step 7 so the logs are split between two distinct served versions.
-- Step 9 changes aliases and the live endpoint immediately (see section 7b below).
-- Run-order steps (1–9) above differ from the section numbers below (1–8).
+- Step 5 must run **before** step 8b: the endpoint is created only by `deploy.py` with `run_type=training`.
+  The retraining job runs `deploy.py` with `run_type=retraining`, which never creates an endpoint — if the
+  endpoint does not exist, the `deploy` task fails with `run_type=retraining but endpoint '<name>' does not exist`.
+  The same applies per target: before the first prod retrain run, `advisor-risk-model-prod` must have been
+  created by a `run_type=training` deploy against `mlops_prod` (steps 1–5 with prod `catalog` / `endpoint_name` values).
+- Step 6 must run **before** step 7b: the quality monitor is created on `advisor_risk_evaluation`, so the table must exist.
+- Step 9a must run **after** step 8b so the logs are split between two distinct served versions.
+- Step 10 changes aliases and the live endpoint immediately (see the **A/B Test Resolution** section below).
+- Monitoring dashboard (created by step 7b): dev `/Workspace/Shared/advisor-risk-mlops/dev/monitoring_assets`,
+  prod `/Workspace/Shared/advisor-risk-mlops-prod/monitoring_assets` (`var.monitoring_assets_dir`).
+- Dev/prod isolation: every job passes `catalog`, `schema`, `model_name`, `endpoint_name` and `experiment_name`
+  as job parameters, and `src/config.py` applies them over `config.yaml`. A prod run only touches
+  `mlops_prod.*`, endpoint `advisor-risk-model-prod`, experiment `/Shared/advisor-risk-experiment-prod`
+  and the prod dashboard folder. Note: in prod mode the job schedules are **active** (retrain Mon 06:00, A/B Fri 09:00 ET).
+- Run-order steps (1–10, e.g. 7b) above are different from the section numbers below (1–8, e.g. section 7b).
 
 ---
 
@@ -60,8 +138,9 @@ end-to-end without client data access.
 
 The **A/B evaluation dataset** `advisor_risk_evaluation` (simulated inference logs + actual
 labels) is generated separately by `notebooks/synthetic_inference_logs`, because inference
-data only exists **after** deployment. Run it after the retraining job has put a new
-`@challenger` on the endpoint at 50/50 (run-order step 8, see section 7b).
+data only exists **after** deployment. Run it once after the first `deploy.py` (creates the
+table the quality monitor needs, run-order step 6) and again after the retraining job has put a
+new `@challenger` on the endpoint at 50/50 (run-order step 9a, see the A/B Test Resolution section).
 
 ---
 
@@ -115,12 +194,7 @@ Reads the three source tables for the latest available month and engineers
 | `advisor_risk_features` | `Salesforce_Id__c` | Training — 14 features + `at_risk` label |
 | `advisor_serving_features` | `Salesforce_Id__c` | Serving lookup — 14 features, **no label**, de-duplicated. This is what the real-time endpoint loads at startup to look up features by advisor ID. |
 
-**Drift monitoring table:** The notebook also writes `advisor_risk_features_drift`,
-a copy of the training data with real labels. **⚠️ This is a demo scaffold only.
-In production the client must build a pipeline (e.g. a Lakeflow Spark Declarative
-Pipeline or scheduled job) that populates this table from real scored traffic
-with real labels — not a training-set copy.** Monitoring and alerting depend on
-this table reflecting actual inference-time data.
+`advisor_risk_features` is also the **baseline** for the quality monitor (section 8).
 
 **Synthetic label:** `at_risk = 1` when an advisor underperforms team benchmarks
 on >50% of metrics, has adopted fewer than 4 tools, and has a concentrated
@@ -291,31 +365,35 @@ Archived versions are never deleted, so a rollback is just re-pointing `@champio
 ### 8. Monitoring & Alerting (fully declarative via DABs)
 
 Monitoring and alerting are **100% declarative** — no notebooks, no SDK scripts.
-Everything is deployed with a single `bundle deploy`.
+Everything is deployed by `databricks bundle deploy -t <target>` (run-order step 7b) — see "What step 7b deploys" above.
 
 **Quality Monitor** (`resources/advisor_drift.quality_monitor.yml`):
 
-A Lakehouse Quality Monitor (InferenceLog type) on `advisor_risk_features_drift`:
-- Compares against `advisor_risk_features` (training baseline)
-- Outputs `_profile_metrics` and `_drift_metrics` tables to `{catalog}.{schema}`
+A Lakehouse Quality Monitor (InferenceLog type) on the inference log table `advisor_risk_evaluation`
+(`var.monitored_table` = `tables.evaluation`):
+- Columns: `inference_timestamp` (timestamp), `model_version` (model id), `prediction`, `at_risk` (label)
+- Baseline: `advisor_risk_features` (training data) — feature drift vs what the model was trained on
+- Outputs `advisor_risk_evaluation_profile_metrics` and `advisor_risk_evaluation_drift_metrics` to `{catalog}.{schema}`
+- Dashboard: `var.monitoring_assets_dir` — dev `/Workspace/Shared/advisor-risk-mlops/dev/monitoring_assets`, prod `/Workspace/Shared/advisor-risk-mlops-prod/monitoring_assets` (never overwrite each other)
 - Refreshes daily at 08:00 ET on its own schedule
+- **The table must exist before `databricks bundle deploy -t <target>` (run-order step 7b)** — the monitor is created on it
 - Fully parameterized via `databricks.yml` variables
 
-**SQL Alerts** (deployed automatically with `bundle deploy`):
+**SQL Alerts** (created by `databricks bundle deploy -t <target>`, run-order step 7b):
 
 | Alert | Resource file | Trigger |
 | --- | --- | --- |
 | Feature drift vs baseline | `feature_drift.alert.yml` | KS or chi-squared p-value < 0.05 |
 | Model quality degradation | `model_quality.alert.yml` | Recall < 0.40, precision < 0.50, or F1 < 0.45 |
-| Prediction PSI shift | `prediction_psi.alert.yml` | PSI > 0.2 vs baseline |
+| Prediction PSI shift | `prediction_psi.alert.yml` | PSI > 0.2 vs the previous window (the training baseline has no predictions) |
 
 All alerts run daily at 08:30 ET (30 min after monitor refresh), notify via email,
-and are parameterized through `databricks.yml` variables (`${var.drift_table}`,
+and are parameterized through `databricks.yml` variables (`${var.monitored_table}`,
 `${var.warehouse_id}`, `${var.notify_email}`).
 
-**⚠️ The `advisor_risk_features_drift` table is seeded from training data as a demo
-scaffold. In production, the client must build a pipeline to populate it from real
-scored traffic with real labels.** See step 13 in the client checklist below.
+**⚠️ In the demo `advisor_risk_evaluation` is simulated from training data. In production it is
+built by the data engineering pipeline from the endpoint's inference logs + actual labels**
+(client checklist step 8) — the same table drives monitoring and the A/B test.
 
 ---
 
@@ -344,7 +422,7 @@ online-model-mlops-rbc/
 │   └── ab_test_resolution.job.yml         # Weekly A/B test conclusion (runs ab_test.py)
 ├── notebooks/
 │   ├── synthetic_data               # Synthetic source tables (placeholder, run first)
-│   └── synthetic_inference_logs     # Synthetic A/B evaluation dataset (placeholder, run after deploy)
+│   └── synthetic_inference_logs     # Synthetic inference logs for monitoring + A/B test (placeholder, run after deploy)
 ├── databricks.yml                     # DABs bundle config (variables, targets)
 └── README.md          # This file
 ```
@@ -360,8 +438,8 @@ online-model-mlops-rbc/
 | `advisor_holdings_360` | Source | Fund holdings |
 | `advisor_risk_features` | Training | 14 features + `at_risk` label |
 | `advisor_serving_features` | Serving | 14 features, no label — real-time endpoint lookup |
-| `advisor_risk_features_drift` | Monitoring | Copy of training data (demo); **replace with real scored traffic + labels via a pipeline** |
-| `advisor_risk_evaluation` | A/B evaluation | Inference logs + actual label (demo: simulated from training data); **replace with a data engineering pipeline** |
+| `advisor_risk_evaluation` | Inference log | Inference logs + actual label — monitored by the quality monitor and used by the A/B test (demo: simulated from training data); **replace with a data engineering pipeline** |
+| `advisor_risk_evaluation_profile_metrics` / `_drift_metrics` | Monitoring | Created by the quality monitor; queried by the SQL alerts |
 
 All tables live in `{catalog}.{schema}` as configured in `config.yaml`.
 
@@ -388,9 +466,9 @@ All tables live in `{catalog}.{schema}` as configured in `config.yaml`.
 5. **Run** `experimentation_optuna_mlflow_tracking` → tune, train and register (first run bootstraps `@champion` + `@challenger`)
 6. **Run** `pyfunc_wrapper.py` → register the serving wrapper (same `model_alias`)
 7. **Run** `deploy.py` (default `run_type=training`) → deploy the champion at 100%
-8. **Schedule** the retraining job — it registers new models as `@challenger` and deploys them 50/50 next to the champion
-9. **Build a data engineering pipeline** to populate `advisor_risk_evaluation` from the inference logs + actual labels
-10. **Run / schedule** `ab_test.py` once enough labelled traffic has accumulated — concludes the test, promotes the winner to `@champion` at 100%, archives the loser
-11. **Replace** the `at_risk` label in `build_features` with your real label
-12. **Replace** the model in `experimentation_optuna_mlflow_tracking` with your own — the serving pipeline stays the same
-13. **Build a pipeline** to populate `advisor_risk_features_drift` from real scored traffic with real labels — the demo copies training data as a scaffold, but drift monitoring requires actual inference-time data to be meaningful
+8. **Build a data engineering pipeline** to populate `advisor_risk_evaluation` from the endpoint's inference logs + actual labels — it drives both monitoring and the A/B test
+9. **Deploy the bundle** once that table exists: `databricks bundle validate --strict -t <target>` → `databricks bundle deploy -t <target>` → `databricks bundle summary -t <target>` — creates the 2 jobs, the quality monitor + dashboard, and the 3 SQL alerts (see "What step 7b deploys")
+10. **Schedule** the retraining job — it registers new models as `@challenger` and deploys them 50/50 next to the champion
+11. **Run / schedule** `ab_test.py` once enough labelled traffic has accumulated — concludes the test, promotes the winner to `@champion` at 100%, archives the loser
+12. **Replace** the `at_risk` label in `build_features` with your real label
+13. **Replace** the model in `experimentation_optuna_mlflow_tracking` with your own — the serving pipeline stays the same

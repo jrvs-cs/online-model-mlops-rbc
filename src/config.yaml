@@ -18,10 +18,11 @@ tables:
   advisor_holdings: advisor_holdings_360
   training: advisor_risk_features
   serving_features: advisor_serving_features
-  drift: advisor_risk_features_drift
   # Inference logs joined with actual labels (features + served model + prediction + at_risk).
   # Populated by a data engineering process in production; seeded by notebooks/synthetic_inference_logs for the demo (run after deploy).
-  # Used by src/serving/ab_test.py to score @champion vs @challenger on the same data.
+  # Used by the Quality Monitor (drift + model quality, baseline = training table) and by
+  # src/serving/ab_test.py to score @champion vs @challenger on the same data.
+  # Must match var.monitored_table in databricks.yml.
   evaluation: advisor_risk_evaluation
 
 # ── Model ──────────────────────────────────────────────────────────

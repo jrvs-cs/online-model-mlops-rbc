@@ -40,6 +40,8 @@ resources:
           default: ${var.model_name}
         - name: endpoint_name
           default: ${var.endpoint_name}
+        - name: experiment_name
+          default: ${var.experiment_name}
 
       tasks:
         - task_key: resolve_ab_test

@@ -4,8 +4,8 @@ All settings live in src/config.yaml (single source of truth).
 This module loads the YAML once and exposes a CFG object so existing
 imports (`from src.config import CFG`) keep working.
 
-DABs job parameters override catalog/schema/model_name/endpoint_name
-at runtime when present.
+DABs job parameters override catalog/schema/model_name/endpoint_name/
+experiment_name at runtime when present (keeps prod jobs in prod objects).
 """
 
 import yaml
@@ -51,7 +51,6 @@ class ProjectConfig:
     advisor_holdings_table: str = _raw["tables"]["advisor_holdings"]
     training_table: str = _raw["tables"]["training"]
     serving_features_table: str = _raw["tables"]["serving_features"]
-    drift_table: str = _raw["tables"]["drift"]
     evaluation_table: str = _raw["tables"]["evaluation"]
 
     # ── Model ──────────────────────────────────────────────────────
@@ -106,6 +105,9 @@ def build_config() -> ProjectConfig:
         ),
         endpoint_name=_get_param(
             "endpoint_name", _raw["serving"]["endpoint_name"]
+        ),
+        experiment_name=_get_param(
+            "experiment_name", _raw["model"]["experiment_name"]
         ),
     )
 

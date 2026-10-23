@@ -17,10 +17,14 @@ resources:
           ks_test.pvalue              AS ks_pvalue,
           chi_squared_test.statistic  AS chi2_statistic,
           chi_squared_test.pvalue     AS chi2_pvalue
-        FROM ${var.catalog}.${var.schema}.${var.drift_table}_drift_metrics
+        FROM ${var.catalog}.${var.schema}.${var.monitored_table}_drift_metrics
         WHERE drift_type = 'BASELINE'
           AND slice_key IS NULL
-          AND column_name NOT IN ('at_risk', ':table')
+          -- features only: exclude label, table-level row, IDs and inference metadata
+          AND column_name NOT IN (
+            'at_risk', ':table', 'Salesforce_Id__c', 'inference_id',
+            'served_model', 'model_version', 'prediction', 'prediction_probability'
+          )
           AND window.start >= current_date() - INTERVAL 1 DAY
           AND (
             ks_test.pvalue < 0.05

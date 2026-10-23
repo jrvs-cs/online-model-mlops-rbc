@@ -1,4 +1,7 @@
-# Retraining pipeline — runs AFTER a champion model is already registered.
+# Retraining pipeline — runs AFTER a champion model is registered AND the
+# endpoint (${var.endpoint_name}) exists. The endpoint is created only by a manual
+# deploy.py run with run_type=training; this job's deploy task (run_type=retraining)
+# fails if the endpoint is missing.
 # Initial model development is interactive (run the README Quick Start steps,
 # incl. src/models/experimentation_optuna_mlflow_tracking).
 # This job rebuilds features, re-tunes + retrains on fresh data (evaluation
@@ -45,6 +48,9 @@ resources:
           default: ${var.model_name}
         - name: endpoint_name
           default: ${var.endpoint_name}
+        # MLflow experiment for training runs (separate per target)
+        - name: experiment_name
+          default: ${var.experiment_name}
         # Alias given to the newly trained model (train + pyfunc_wrapper).
         # Retraining always registers a challenger; promotion happens in the A/B test.
         - name: model_alias

@@ -27,9 +27,9 @@ variables:
   endpoint_name:
     description: Model Serving endpoint name
     default: advisor-risk-model
-  drift_table:
-    description: Drift monitoring table name (without catalog.schema prefix)
-    default: advisor_risk_features_drift
+  monitored_table:
+    description: Inference log table monitored for drift / model quality (without catalog.schema prefix) — same as tables.evaluation in config.yaml
+    default: advisor_risk_evaluation
   training_table:
     description: Training features table name (without catalog.schema prefix)
     default: advisor_risk_features
@@ -44,6 +44,9 @@ variables:
   notify_email:
     description: Email address for alert and job failure notifications
     default: siva.borusu@jrvs.ca
+  monitoring_assets_dir:
+    description: Workspace folder for the quality monitor dashboard (separate per target so dev/prod never overwrite each other)
+    default: /Workspace/Shared/advisor-risk-mlops/dev/monitoring_assets
 
 # ── Targets ────────────────────────────────────────────────────────
 # Both targets use the same workspace; environment isolation is at
@@ -61,6 +64,7 @@ targets:
       warehouse_id: "960eea0736a2e75b"
       git_branch: dev
       experiment_name: /Shared/advisor-risk-experiment
+      monitoring_assets_dir: /Workspace/Shared/advisor-risk-mlops/dev/monitoring_assets
 
   prod:
     mode: production
@@ -73,5 +77,6 @@ targets:
       warehouse_id: "960eea0736a2e75b"
       git_branch: main
       experiment_name: /Shared/advisor-risk-experiment-prod
+      monitoring_assets_dir: /Workspace/Shared/advisor-risk-mlops-prod/monitoring_assets
     run_as:
       user_name: siva.borusu@jrvs.ca

@@ -17,7 +17,7 @@ resources:
           precision.weighted     AS precision_weighted,
           recall.weighted        AS recall_weighted,
           f1_score.weighted      AS f1_weighted
-        FROM ${var.catalog}.${var.schema}.${var.drift_table}_profile_metrics
+        FROM ${var.catalog}.${var.schema}.${var.monitored_table}_profile_metrics
         WHERE column_name = ':table'
           AND log_type = 'INPUT'
           AND slice_key IS NULL
