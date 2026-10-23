@@ -68,7 +68,7 @@ only bootstraps `@champion` + `@challenger` on v1 when the model has no `@champi
 | 4 | `src/models/pyfunc_wrapper.py` | notebook (`model_alias=challenger`) | `advisor_risk_model_pyfunc` v1 → `@champion` + `@challenger` (bootstrap) |
 | 5 | `src/serving/deploy.py` | notebook (`run_type=training`) | endpoint serving `@champion` at 100% + AI Gateway logging |
 | 6 | `notebooks/synthetic_inference_logs` (1st run) | notebook | `advisor_risk_evaluation` — inference logs + actual labels, 100% champion (demo only) |
-| 7a | `databricks bundle validate --strict -t dev` | CLI | config check only — nothing is created |
+| 7a | `databricks bundle validate --strict -t dev` — run from the bundle root (`online-model-mlops-rbc/`, the folder containing `databricks.yml`); `cd` there first (e.g. in the web terminal) | CLI | config check only — nothing is created |
 | 7b | `databricks bundle deploy -t dev` | CLI | creates the 6 bundle resources listed below (needs the table from step 6); runs nothing |
 | 7c | `databricks bundle summary -t dev` | CLI | confirms the 6 resources exist and shows their URLs |
 | 8a | Commit + push to the `dev` branch (create it from `main` the first time) | Git folder UI | the jobs check out `dev` from GitHub at runtime |
