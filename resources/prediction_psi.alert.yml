@@ -1,5 +1,7 @@
 # Prediction distribution shift (PSI) alert.
-# Fires when the at_risk prediction column's PSI exceeds 0.2 vs baseline.
+# Fires when the prediction column's PSI exceeds 0.2 vs the PREVIOUS window
+# (CONSECUTIVE drift). The training baseline has no prediction column, so
+# baseline drift is not available for predictions.
 # Source: Lakehouse Monitor output table _drift_metrics.
 # Schedule: daily at 08:30 ET (30 min after the monitor's 08:00 refresh).
 resources:
@@ -13,8 +15,8 @@ resources:
           granularity,
           population_stability_index AS psi,
           wasserstein_distance
-        FROM ${var.catalog}.${var.schema}.${var.drift_table}_drift_metrics
-        WHERE drift_type = 'BASELINE'
+        FROM ${var.catalog}.${var.schema}.${var.monitored_table}_drift_metrics
+        WHERE drift_type = 'CONSECUTIVE'
           AND column_name = 'prediction'
           AND slice_key IS NULL
           AND window.start >= current_date() - INTERVAL 1 DAY

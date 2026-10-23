@@ -1,18 +1,25 @@
 # Lakehouse Quality Monitor — Advisor Risk Drift Detection
 # Deployed declaratively via DABs. No setup notebook needed.
 #
-# Creates a Quality Monitor (InferenceLog type) on the drift table.
-# Compares against the training baseline for feature/prediction drift.
-# Outputs _profile_metrics and _drift_metrics tables that the three
-# DABs-managed SQL alerts query for automated notifications.
+# Creates a Quality Monitor (InferenceLog type) on the inference log table
+# advisor_risk_evaluation (tables.evaluation in config.yaml): endpoint requests
+# + served model_version + prediction + actual at_risk label. Production: built by
+# a data engineering process; demo: notebooks/synthetic_inference_logs.
+# The table MUST exist before `bundle deploy` (the monitor is created on it).
+#
+# Baseline = training table: feature drift vs training data. The baseline has no
+# prediction column, so prediction drift is tracked window-over-window (CONSECUTIVE).
+# Outputs <table>_profile_metrics and <table>_drift_metrics, queried by the three
+# DABs-managed SQL alerts. Dashboard lands in assets_dir (per target).
 #
 # Deploy:  databricks bundle deploy --target <target>
 # The monitor's own daily schedule (08:00 ET) handles ongoing refreshes.
 resources:
   quality_monitors:
     advisor_drift_monitor:
-      table_name: ${var.catalog}.${var.schema}.${var.drift_table}
-      assets_dir: /Workspace/Shared/advisor-risk-mlops/monitoring_assets
+      table_name: ${var.catalog}.${var.schema}.${var.monitored_table}
+      # Per-target dashboard folder (databricks.yml var.monitoring_assets_dir) — dev/prod never overwrite
+      assets_dir: ${var.monitoring_assets_dir}
       output_schema_name: ${var.catalog}.${var.schema}
       baseline_table_name: ${var.catalog}.${var.schema}.${var.training_table}
       warehouse_id: ${var.warehouse_id}
@@ -24,7 +31,7 @@ resources:
         model_id_col: "model_version"
         prediction_col: "prediction"
         label_col: "at_risk"
-        timestamp_col: "scored_at"
+        timestamp_col: "inference_timestamp"
         problem_type: "PROBLEM_TYPE_CLASSIFICATION"
 
       schedule:
