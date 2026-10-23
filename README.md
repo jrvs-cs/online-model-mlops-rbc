@@ -13,12 +13,16 @@ stays the same.
 Set these up **before** step 1. "Run identity" = the user or service principal (SPN) the jobs run as
 (`run_as` — dev: the deploying user; prod: `siva.borusu@jrvs.ca` in `databricks.yml`).
 
+**Catalog / schema placeholders:** `<catalog>.<schema>` in this README means the values set in `src/config.yaml`
+(`catalog`, `schema`) and in the `databricks.yml` targets (`<prod_catalog>` = the prod target's `catalog`).
+Replace them with your environment's catalog and schema.
+
 **Branches:** `dev` is for development, `main` is for production.
 
 | Branch | Purpose | Bundle target | Jobs check out | Catalog / endpoint |
 | --- | --- | --- | --- | --- |
-| `dev` | Development — all changes are made and tested here first | `dev` | `dev` | `mlops` / `advisor-risk-model` |
-| `main` | Production — only receives tested changes merged from `dev` (pull request) | `prod` | `main` | `mlops_prod` / `advisor-risk-model-prod` |
+| `dev` | Development — all changes are made and tested here first | `dev` | `dev` | `<catalog>` / `advisor-risk-model` |
+| `main` | Production — only receives tested changes merged from `dev` (pull request) | `prod` | `main` | `<prod_catalog>` / `advisor-risk-model-prod` |
 
 CI (`.github/workflows/ci.yml`) runs the checks on every push / pull request; the deploy step runs only
 when triggered manually from `main`.
@@ -32,7 +36,7 @@ when triggered manually from `main`.
 | **Job clusters** | Permission to create clusters (unrestricted cluster creation, or a cluster policy that allows `Standard_DS3_v2`, DBR `19.x-scala2.13` ML, single user) | Run identity | `ml_cluster` in both jobs |
 | **Interactive cluster** | CAN ATTACH TO / CAN RESTART on an ML runtime cluster (DBR 19 ML) | Person running the notebooks | Steps 1–6, 9a |
 | **SQL warehouse** | CAN USE on warehouse `960eea0736a2e75b` | Run identity, alert owner, serving endpoint (auto-provisioned via the pyfunc's declared resources) | Feature lookup in the pyfunc, quality monitor, SQL alerts |
-| **Unity Catalog** | `USE CATALOG` on `mlops` (dev) / `mlops_prod` (prod); `USE SCHEMA`, `CREATE TABLE`, `CREATE MODEL` on `siva_borusu`; `SELECT` / `MODIFY` on its tables; owner or `MANAGE` on `advisor_risk_evaluation` to create the monitor. The prod catalog + schema must already exist | Person running the notebooks + run identity | Tables, registered models, monitor output tables, AI Gateway inference table |
+| **Unity Catalog** | `USE CATALOG` on `<catalog>` (dev) / `<prod_catalog>` (prod); `USE SCHEMA`, `CREATE TABLE`, `CREATE MODEL` on `<schema>`; `SELECT` / `MODIFY` on its tables; owner or `MANAGE` on `advisor_risk_evaluation` to create the monitor. The prod catalog + schema must already exist | Person running the notebooks + run identity | Tables, registered models, monitor output tables, AI Gateway inference table |
 | **Model Serving** | Permission to create serving endpoints, and CAN MANAGE on `advisor-risk-model` / `advisor-risk-model-prod` | Person running step 5 + run identity | `deploy.py`, `ab_test.py` |
 | **MLflow** | CAN EDIT / CAN MANAGE on `/Shared/advisor-risk-experiment` (dev) and `/Shared/advisor-risk-experiment-prod` (prod) or the `/Shared` folder | Person running the notebooks + run identity | Training + pyfunc runs |
 | **Workspace folders** | Write access to `/Workspace/Shared/advisor-risk-mlops/dev/` and `/Workspace/Shared/advisor-risk-mlops-prod/` | Person deploying the bundle | Monitor dashboards |
@@ -74,7 +78,7 @@ only bootstraps `@champion` + `@challenger` on v1 when the model has no `@champi
 | 8a | Commit + push to the `dev` branch (create it from `main` the first time) | Git folder UI | the jobs check out `dev` from GitHub at runtime |
 | 8b | `databricks bundle run advisor_risk_retrain -t dev --params force_retrain=true` (or job page → **Run now with different settings** → `force_retrain` = `true`) | CLI → job | `check_drift` → `retrain_needed` → `build_features` → `train` → `pyfunc_wrapper` → `deploy` (`run_type=retraining`): new `@challenger`, endpoint 50/50. `force_retrain=true` is needed here because the demo inference logs come from the training data, so no drift is detected |
 | 9a | `notebooks/synthetic_inference_logs` (2nd run) | notebook | inference logs split 50/50 between champion and challenger |
-| 9b | `databricks quality-monitors run-refresh mlops.siva_borusu.advisor_risk_evaluation` | CLI (or Catalog Explorer → table → **Quality** tab → **Refresh metrics**) | refreshes monitor metrics + dashboard now (otherwise daily 08:00 ET) |
+| 9b | `databricks quality-monitors run-refresh <catalog>.<schema>.advisor_risk_evaluation` | CLI (or Catalog Explorer → table → **Quality** tab → **Refresh metrics**) | refreshes monitor metrics + dashboard now (otherwise daily 08:00 ET) |
 | 10 | `databricks bundle run ab_test_resolution -t dev` (or run `src/serving/ab_test.py` interactively) | CLI → job | test concluded: winner `@champion` at 100%, loser `archive_<ts>`, `@challenger` removed |
 
 Run the CLI commands from the bundle root (`online-model-mlops-rbc/`, where `databricks.yml` lives),
@@ -102,7 +106,7 @@ Notes:
   The retraining job runs `deploy.py` with `run_type=retraining`, which never creates an endpoint — if the
   endpoint does not exist, the `deploy` task fails with `run_type=retraining but endpoint '<name>' does not exist`.
   The same applies per target: before the first prod retrain run, `advisor-risk-model-prod` must have been
-  created by a `run_type=training` deploy against `mlops_prod` (steps 1–5 with prod `catalog` / `endpoint_name` values).
+  created by a `run_type=training` deploy against `<prod_catalog>` (steps 1–5 with prod `catalog` / `endpoint_name` values).
 - Step 6 must run **before** step 7b: the quality monitor is created on `advisor_risk_evaluation`, so the table must exist.
 - Step 9a must run **after** step 8b so the logs are split between two distinct served versions.
 - Step 10 changes aliases and the live endpoint immediately (see the **A/B Test Resolution** section below).
@@ -110,7 +114,7 @@ Notes:
   prod `/Workspace/Shared/advisor-risk-mlops-prod/monitoring_assets` (`var.monitoring_assets_dir`).
 - Dev/prod isolation: every job passes `catalog`, `schema`, `model_name`, `endpoint_name` and `experiment_name`
   as job parameters, and `src/config.py` applies them over `config.yaml`. A prod run only touches
-  `mlops_prod.*`, endpoint `advisor-risk-model-prod`, experiment `/Shared/advisor-risk-experiment-prod`
+  `<prod_catalog>.<schema>.*`, endpoint `advisor-risk-model-prod`, experiment `/Shared/advisor-risk-experiment-prod`
   and the prod dashboard folder. Note: in prod mode the job schedules are **active** (retrain Mon 06:00, A/B Fri 09:00 ET).
 - Run-order steps (1–10, e.g. 7b) above are different from the section numbers below (1–8, e.g. section 7b "A/B Test Resolution").
 
@@ -392,6 +396,10 @@ A Lakehouse Quality Monitor (InferenceLog type) on the inference log table `advi
   baseline to have the same `model_version` / `prediction` / label columns as the monitored table.
 - Outputs `advisor_risk_evaluation_profile_metrics` and `advisor_risk_evaluation_drift_metrics` to `{catalog}.{schema}`
 - Dashboard: `var.monitoring_assets_dir` — dev `/Workspace/Shared/advisor-risk-mlops/dev/monitoring_assets`, prod `/Workspace/Shared/advisor-risk-mlops-prod/monitoring_assets` (never overwrite each other)
+- **Opening the dashboard** (either way):
+  - Catalog Explorer → `<catalog>.<schema>.advisor_risk_evaluation` (prod: `<prod_catalog>.<schema>.advisor_risk_evaluation`) → **Quality** tab → **View dashboard**
+  - Workspace → the `monitoring_assets` folder above → open the `advisor_risk_evaluation` dashboard
+  - Charts are empty until the first refresh completes (step 9b, or the daily 08:00 ET refresh)
 - Refreshes daily at 08:00 ET on its own schedule
 - **The table must exist before `databricks bundle deploy -t <target>` (run-order step 7b)** — the monitor is created on it
 - Fully parameterized via `databricks.yml` variables
