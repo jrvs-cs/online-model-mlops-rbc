@@ -21,7 +21,8 @@ resources:
       # Per-target dashboard folder (databricks.yml var.monitoring_assets_dir) — dev/prod never overwrite
       assets_dir: ${var.monitoring_assets_dir}
       output_schema_name: ${var.catalog}.${var.schema}
-      baseline_table_name: ${var.catalog}.${var.schema}.${var.training_table}
+      # Baseline must contain the same model_id / prediction / label columns as the monitored table
+      baseline_table_name: ${var.catalog}.${var.schema}.${var.baseline_table}
       warehouse_id: ${var.warehouse_id}
 
       inference_log:
