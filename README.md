@@ -62,7 +62,7 @@ only bootstraps `@champion` + `@challenger` on v1 when the model has no `@champi
 
 | # | Step | Where | Result |
 | --- | --- | --- | --- |
-| 1 | `notebooks/synthetic_data` | notebook | 3 source tables (demo only) |
+| 1 | `notebooks/synthetic_data` — **skip if the 3 `*_360` source tables already exist** (it overwrites them) | notebook | 3 source tables (demo only) |
 | 2 | `src/feature_engineering/build_features` | notebook | training + serving-lookup tables |
 | 3 | `src/models/experimentation_optuna_mlflow_tracking` | notebook (`model_alias=challenger`) | `advisor_risk_model` v1 → `@champion` + `@challenger` (bootstrap) |
 | 4 | `src/models/pyfunc_wrapper.py` | notebook (`model_alias=challenger`) | `advisor_risk_model_pyfunc` v1 → `@champion` + `@challenger` (bootstrap) |
@@ -431,15 +431,16 @@ online-model-mlops-rbc/
 
 ## Key Tables
 
-| Table | Type | Purpose |
-| --- | --- | --- |
-| `book_profile_360` | Source | Advisor performance benchmarks |
-| `tools_adoption_360` | Source | Tool usage sessions |
-| `advisor_holdings_360` | Source | Fund holdings |
-| `advisor_risk_features` | Training | 14 features + `at_risk` label |
-| `advisor_serving_features` | Serving | 14 features, no label — real-time endpoint lookup |
-| `advisor_risk_evaluation` | Inference log | Inference logs + actual label — monitored by the quality monitor and used by the A/B test (demo: simulated from training data); **replace with a data engineering pipeline** |
-| `advisor_risk_evaluation_profile_metrics` / `_drift_metrics` | Monitoring | Created by the quality monitor; queried by the SQL alerts |
+| Table | Type | Purpose | Created by (run-order step) |
+| --- | --- | --- | --- |
+| `book_profile_360` | Source | Advisor performance benchmarks | Pre-existing in the client system (demo: step 1) |
+| `tools_adoption_360` | Source | Tool usage sessions | Pre-existing in the client system (demo: step 1) |
+| `advisor_holdings_360` | Source | Fund holdings | Pre-existing in the client system (demo: step 1) |
+| `advisor_risk_features` | Training | 14 features + `at_risk` label; also the monitor baseline | `build_features` — step 2, re-built by the retrain job (8b) |
+| `advisor_serving_features` | Serving | 14 features, no label — real-time endpoint lookup | `build_features` — step 2, re-built by the retrain job (8b) |
+| `advisor_risk_evaluation` | Inference log | Inference logs + actual label — monitored by the quality monitor and used by the A/B test (demo: simulated from training data); **replace with a data engineering pipeline** | `synthetic_inference_logs` — steps 6 and 9a |
+| `advisor_risk_evaluation_profile_metrics` / `_drift_metrics` | Monitoring | Monitor output; queried by the SQL alerts | Quality monitor — first refresh after step 7b |
+| `advisor-risk-model_payload` | Serving log | Raw endpoint requests/responses (AI Gateway inference table) — source for the evaluation pipeline in production | Endpoint — after step 5, filled as requests arrive |
 
 All tables live in `{catalog}.{schema}` as configured in `config.yaml`.
 
