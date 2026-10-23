@@ -35,6 +35,7 @@ from src.utils import get_logger
 logger = get_logger("serving.ab_test")
 w = WorkspaceClient()
 mlflow.set_registry_uri("databricks-uc")
+mlflow.set_experiment(CFG.experiment_name)  # one shared experiment for the whole repo
 mlflow_client = MlflowClient(registry_uri="databricks-uc")
 
 LABEL_COL = "at_risk"            # actual label in the evaluation dataset
