@@ -2,6 +2,12 @@
 # Fires when weighted recall, precision, or F1 drop below thresholds
 # in the latest monitoring window.
 # Source: Lakehouse Monitor output table _profile_metrics.
+# Thresholds: recall.weighted >= 0.40, precision.weighted >= 0.50,
+# f1_score.weighted >= 0.45.
+# Evaluation: an alert can only test one column, so the query computes
+# min_margin = the smallest (metric - threshold) across the three metrics.
+# MIN(min_margin) < 0 means at least one metric is below its floor; the
+# value shows how far below. No rows (monitor has not refreshed) = OK.
 # Schedule: daily at 08:30 ET (30 min after the monitor's 08:00 refresh).
 resources:
   alerts:
@@ -16,28 +22,31 @@ resources:
           accuracy_score,
           precision.weighted     AS precision_weighted,
           recall.weighted        AS recall_weighted,
-          f1_score.weighted      AS f1_weighted
+          f1_score.weighted      AS f1_weighted,
+          LEAST(
+            recall.weighted    - 0.40,
+            precision.weighted - 0.50,
+            f1_score.weighted  - 0.45
+          )                      AS min_margin
         FROM ${var.catalog}.${var.schema}.${var.monitored_table}_profile_metrics
         WHERE column_name = ':table'
           AND log_type = 'INPUT'
           AND slice_key IS NULL
           AND window.start >= current_date() - INTERVAL 1 DAY
-          AND (
-            recall.weighted    < 0.40
-            OR precision.weighted < 0.50
-            OR f1_score.weighted  < 0.45
-          )
-        LIMIT 1
+          AND COALESCE(recall.weighted, precision.weighted, f1_score.weighted) IS NOT NULL
+        ORDER BY min_margin ASC
       warehouse_id: ${var.warehouse_id}
 
       evaluation:
-        comparison_operator: "GREATER_THAN"
+        comparison_operator: "LESS_THAN"
         source:
-          name: "window_start"
-          display: "window_start"
+          name: "min_margin"
+          display: "min_margin"
+          aggregation: "MIN"
         threshold:
           value:
             double_value: 0.0
+        empty_result_state: "OK"
         notification:
           notify_on_ok: false
           subscriptions:
