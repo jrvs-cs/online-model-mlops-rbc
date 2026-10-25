@@ -2,6 +2,11 @@
 # Fires when ANY feature shows statistically significant drift
 # against the baseline (p-value < 0.05).
 # Source: Lakehouse Monitor output table _drift_metrics.
+# Evaluation: MIN(min_pvalue) across features < 0.05 triggers the alert.
+# min_pvalue = the smaller of the KS (numeric) and chi-squared (categorical)
+# p-values per feature. The query returns every feature (no threshold in
+# SQL) so the alert condition owns the 0.05 cutoff and the most-drifted
+# feature is listed first. No rows (monitor has not refreshed) = OK.
 # Schedule: daily at 08:30 ET (30 min after the monitor's 08:00 refresh).
 resources:
   alerts:
@@ -16,7 +21,8 @@ resources:
           ks_test.statistic           AS ks_statistic,
           ks_test.pvalue              AS ks_pvalue,
           chi_squared_test.statistic  AS chi2_statistic,
-          chi_squared_test.pvalue     AS chi2_pvalue
+          chi_squared_test.pvalue     AS chi2_pvalue,
+          LEAST(ks_test.pvalue, chi_squared_test.pvalue) AS min_pvalue
         FROM ${var.catalog}.${var.schema}.${var.monitored_table}_drift_metrics
         WHERE drift_type = 'BASELINE'
           AND slice_key IS NULL
@@ -26,22 +32,20 @@ resources:
             'served_model', 'model_version', 'prediction', 'prediction_probability'
           )
           AND window.start >= current_date() - INTERVAL 1 DAY
-          AND (
-            ks_test.pvalue < 0.05
-            OR chi_squared_test.pvalue < 0.05
-          )
-        ORDER BY COALESCE(ks_test.pvalue, chi_squared_test.pvalue) ASC
-        LIMIT 1
+          AND LEAST(ks_test.pvalue, chi_squared_test.pvalue) IS NOT NULL
+        ORDER BY min_pvalue ASC
       warehouse_id: ${var.warehouse_id}
 
       evaluation:
-        comparison_operator: "GREATER_THAN"
+        comparison_operator: "LESS_THAN"
         source:
-          name: "window_start"
-          display: "window_start"
+          name: "min_pvalue"
+          display: "min_pvalue"
+          aggregation: "MIN"
         threshold:
           value:
-            double_value: 0.0
+            double_value: 0.05
+        empty_result_state: "OK"
         notification:
           notify_on_ok: false
           subscriptions:
