@@ -44,18 +44,6 @@ logger.info(f"Wrapping sklearn model @{MODEL_ALIAS}")
 # COMMAND ----------
 
 # DBTITLE 1,AdvisorRiskWrapper class
-FEATURE_COLS = [
-    # Book profile — benchmark ratios
-    "avg_advisor_value", "avg_vs_team_ratio", "avg_vs_region_ratio",
-    "metrics_below_team", "metrics_below_region",
-    "pct_below_team", "pct_below_region",
-    # Tool adoption
-    "total_advisor_sessions", "tools_adopted_count", "avg_sessions_vs_team",
-    # Holdings — portfolio concentration
-    "total_aum", "num_funds", "max_fund_pct", "hhi_concentration",
-]
-
-
 class AdvisorRiskWrapper(mlflow.pyfunc.PythonModel):
     """
     Custom pyfunc that wraps the advisor risk sklearn pipeline.
@@ -70,8 +58,27 @@ class AdvisorRiskWrapper(mlflow.pyfunc.PythonModel):
       - Returns: at_risk prediction (0/1) and probability
     """
 
+    # Model input features (order matters — must match training). Class attribute so it is
+    # explicitly serialized with the model.
+    FEATURE_COLS = [
+        # Book profile — benchmark ratios
+        "avg_advisor_value", "avg_vs_team_ratio", "avg_vs_region_ratio",
+        "metrics_below_team", "metrics_below_region",
+        "pct_below_team", "pct_below_region",
+        # Tool adoption
+        "total_advisor_sessions", "tools_adopted_count", "avg_sessions_vs_team",
+        # Holdings — portfolio concentration
+        "total_aum", "num_funds", "max_fund_pct", "hhi_concentration",
+    ]
+
     SERVING_FEATURES_TABLE = SERVING_FEATURES_FQ
     WAREHOUSE_ID = CFG.sql_warehouse_id
+
+    @staticmethod
+    def _get_logger():
+        """Project logger; src.utils is shipped to serving via code_paths."""
+        from src.utils.logger import get_logger
+        return get_logger("AdvisorRiskWrapper")
 
     def load_context(self, context):
         """Load the inner model and advisor features from Delta table."""
@@ -85,14 +92,31 @@ class AdvisorRiskWrapper(mlflow.pyfunc.PythonModel):
         automatically via the model's declared resources (DatabricksSQLWarehouse
         + DatabricksTable passed to mlflow.pyfunc.log_model).
         """
+        import time
         from databricks.sdk import WorkspaceClient
 
+        _logger = self._get_logger()
+
         w = WorkspaceClient()
+        _logger.info(
+            f"Querying serving features: table={self.SERVING_FEATURES_TABLE}, "
+            f"warehouse_id={self.WAREHOUSE_ID}"
+        )
+        t0 = time.time()
         stmt = w.statement_execution.execute_statement(
             warehouse_id=self.WAREHOUSE_ID,
             statement=f"SELECT * FROM {self.SERVING_FEATURES_TABLE}",
             wait_timeout="30s",
         )
+        elapsed = time.time() - t0
+        state = stmt.status.state if stmt.status else None
+        _logger.info(
+            f"Statement {stmt.statement_id} finished with state={state} in {elapsed:.2f}s"
+        )
+        if state is None or state.value != "SUCCEEDED":
+            err = stmt.status.error if stmt.status else None
+            _logger.error(f"Serving features query did not succeed: state={state}, error={err}")
+            raise RuntimeError(f"Serving features query failed: state={state}, error={err}")
 
         cols = [c.name for c in stmt.manifest.schema.columns]
         col_types = {c.name: c.type_name for c in stmt.manifest.schema.columns}
@@ -115,25 +139,36 @@ class AdvisorRiskWrapper(mlflow.pyfunc.PythonModel):
                     self.serving_features[name], errors="coerce"
                 ).astype("Int64")
 
+        _logger.info(
+            f"Loaded {len(self.serving_features)} advisor rows x {len(cols)} columns "
+            f"(total_row_count={stmt.manifest.total_row_count}, "
+            f"chunks={stmt.manifest.total_chunk_count}, truncated={stmt.manifest.truncated})"
+        )
+
     def predict(self, context, model_input, params=None):
         """Look up features by Salesforce_Id__c and predict."""
-        import logging
-        _logger = logging.getLogger("AdvisorRiskWrapper")
+        _logger = self._get_logger()
 
         df = model_input.copy()
 
         # Join advisor features by Salesforce_Id__c
         df = df.merge(self.serving_features, on="Salesforce_Id__c", how="left")
 
+        # Features come from the in-memory cache loaded in load_context (not a per-request query)
+        _logger.info(
+            f"Feature lookup from cache ({len(self.serving_features)} cached rows): "
+            f"{len(model_input)} requested IDs -> merged df:\n{df.to_string(index=False)}"
+        )
+
         # Warn on unknown advisor IDs (imputer will fill NaNs with training medians)
-        unknown_mask = df[FEATURE_COLS].isna().all(axis=1)
+        unknown_mask = df[self.FEATURE_COLS].isna().all(axis=1)
         if unknown_mask.any():
             unknown_ids = model_input.loc[unknown_mask, "Salesforce_Id__c"].tolist()
             _logger.warning(f"Unknown advisor IDs (features imputed with medians): {unknown_ids}")
 
         # Predict class and probability
-        preds = self.model.predict(df[FEATURE_COLS])
-        probs = self.model.predict_proba(df[FEATURE_COLS])[:, 1]
+        preds = self.model.predict(df[self.FEATURE_COLS])
+        probs = self.model.predict_proba(df[self.FEATURE_COLS])[:, 1]
 
         return pd.DataFrame({
             "Salesforce_Id__c": model_input["Salesforce_Id__c"],
@@ -154,6 +189,8 @@ class AdvisorRiskWrapper(mlflow.pyfunc.PythonModel):
 
 # DBTITLE 1,Save artifacts, log pyfunc, and assign alias
 import tempfile, os
+import cloudpickle, lightgbm, sklearn, pyarrow
+import databricks.sdk.version as _dbsdk_version
 from mlflow.models import ModelSignature
 from mlflow.types import Schema, ColSpec
 
@@ -166,17 +203,42 @@ output_schema = Schema([
 ])
 signature = ModelSignature(inputs=input_schema, outputs=output_schema)
 
-# Input example — what a caller sends to the endpoint
-input_example = pd.DataFrame([{"Salesforce_Id__c": "0031I00000840aQAA"}])
+# Input example — what a caller sends to the endpoint (real ID present in the serving features table)
+input_example = pd.DataFrame([{"Salesforce_Id__c": "0031I0000084aadQAA"}])
 
-# Load the sklearn model at the requested alias from UC and save as local artifact
-inner_model_uri = f"models:/{CFG.fq_model_name}@{MODEL_ALIAS}"
+# Load the inner sklearn model at @champion from UC and save as local artifact
+INNER_MODEL_ALIAS = CFG.model_champion_alias
+inner_model_uri = f"models:/{CFG.fq_model_name}@{INNER_MODEL_ALIAS}"
 logger.info(f"Loading inner model from: {inner_model_uri}")
 inner_model = mlflow.sklearn.load_model(inner_model_uri)
 
 tmp_dir = tempfile.mkdtemp()
 inner_model_path = os.path.join(tmp_dir, "sklearn_model")
 mlflow.sklearn.save_model(inner_model, inner_model_path)
+
+# Stage a minimal copy of the `src` package for code_paths: only the logger is needed at serving time.
+# (Shipping just these files avoids pulling pyspark-dependent modules / notebooks into the model.)
+import shutil
+import src as _src_pkg
+
+SRC_DIR = os.path.dirname(_src_pkg.__file__)
+code_stage_dir = os.path.join(tmp_dir, "code", "src")
+os.makedirs(os.path.join(code_stage_dir, "utils"), exist_ok=True)
+for rel in ["__init__.py", "utils/__init__.py", "utils/logger.py"]:
+    shutil.copy(os.path.join(SRC_DIR, rel), os.path.join(code_stage_dir, rel))
+logger.info(f"Staged code_paths package from {SRC_DIR} -> {code_stage_dir}")
+
+# Pin serving dependencies to the versions installed here (the env that pickles the wrapper)
+PIP_REQUIREMENTS = [
+    f"mlflow=={mlflow.__version__}",
+    f"lightgbm=={lightgbm.__version__}",
+    f"scikit-learn=={sklearn.__version__}",
+    f"pandas=={pd.__version__}",
+    f"pyarrow=={pyarrow.__version__}",
+    f"databricks-sdk=={_dbsdk_version.__version__}",
+    f"cloudpickle=={cloudpickle.__version__}",
+]
+logger.info(f"pip_requirements: {PIP_REQUIREMENTS}")
 
 # Declare resources so serving auto-provisions OAuth M2M access
 from mlflow.models.resources import DatabricksSQLWarehouse, DatabricksTable
@@ -194,18 +256,12 @@ with mlflow.start_run(run_name=f"advisor_risk_pyfunc_{MODEL_ALIAS}") as run:
         name="model",
         python_model=AdvisorRiskWrapper(),
         artifacts={"sklearn_model": inner_model_path},
+        code_paths=[code_stage_dir],  # copied to <model>/code/src and added to sys.path at load
         registered_model_name=CFG.fq_pyfunc_model_name,
         signature=signature,
         input_example=input_example,
         resources=resources,
-        pip_requirements=[
-            "mlflow==3.12.0",
-            "lightgbm==4.6.0",
-            "scikit-learn==1.7.2",
-            "pandas==2.3.3",
-            "pyarrow==21.0.0",
-            "databricks-sdk==0.108.0",
-        ],
+        pip_requirements=PIP_REQUIREMENTS,
     )
     logger.info(f"Run ID: {run.info.run_id}")
     logger.info(f"Wrapper model registered: {CFG.fq_pyfunc_model_name}")

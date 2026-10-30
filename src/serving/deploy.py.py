@@ -19,7 +19,6 @@
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import (
     ServedEntityInput, TrafficConfig, Route,
-    AiGatewayInferenceTableConfig, AiGatewayUsageTrackingConfig,
 )
 from mlflow.tracking import MlflowClient
 from src.config import CFG
@@ -49,6 +48,7 @@ logger.info(f"Warehouse:     {CFG.sql_warehouse_id}")
 # COMMAND ----------
 
 # DBTITLE 1,Deploy based on run type
+import requests
 from datetime import timedelta
 from databricks.sdk.errors import NotFound
 from databricks.sdk.service.serving import EndpointCoreConfigInput
@@ -71,12 +71,47 @@ def _served_entity(version: str, served_name: str) -> ServedEntityInput:
     )
 
 
-def _endpoint_exists() -> bool:
+def _api(path: str) -> str:
+    return f"{w.config.host.rstrip('/')}/api/2.0/serving-endpoints/{path}"
+
+
+def _headers() -> dict:
+    # Notebook / job identity via WorkspaceClient — no token in code
+    return {**w.config.authenticate(), "Content-Type": "application/json"}
+
+
+def _enable_ai_gateway() -> dict:
+    """Enable inference table + usage tracking with
+    PUT /api/2.0/serving-endpoints/{endpoint-name}/ai-gateway.
+
+    PUT replaces the whole AI Gateway config, so any existing rate limits,
+    guardrails and fallbacks (read via GET) are carried over.
+    """
+    get = requests.get(_api(CFG.endpoint_name), headers=_headers(), timeout=60)
+    get.raise_for_status()
+    payload = get.json().get("ai_gateway", {}) or {}
+
+    payload["inference_table_config"] = {
+        "catalog_name": CFG.catalog,
+        "schema_name": CFG.schema,
+        "enabled": True,
+    }
+    payload["usage_tracking_config"] = {"enabled": True}
+
+    resp = requests.put(
+        _api(f"{CFG.endpoint_name}/ai-gateway"),
+        headers=_headers(), json=payload, timeout=60,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"PUT ai-gateway failed [{resp.status_code}]: {resp.text}")
+    return resp.json()
+
+
+def _get_endpoint():
     try:
-        w.serving_endpoints.get(name=CFG.endpoint_name)
-        return True
+        return w.serving_endpoints.get(name=CFG.endpoint_name)
     except NotFound:
-        return False
+        return None
 
 
 def deploy():
@@ -84,11 +119,12 @@ def deploy():
 
     training   -> @champion only, 100% traffic (creates the endpoint if needed)
     retraining -> existing endpoint: @champion + @challenger, 50/50 traffic
-    Waits for each config update to finish, otherwise put_ai_gateway fails
-    with ResourceConflict (endpoint still updating).
+    After every create/update, AI Gateway (inference table + usage tracking)
+    is enabled with PUT /api/2.0/serving-endpoints/{endpoint-name}/ai-gateway.
     """
     model_name = CFG.fq_pyfunc_model_name
-    exists = _endpoint_exists()
+    endpoint = _get_endpoint()
+    exists = endpoint is not None
 
     champion_mv = mlflow_client.get_model_version_by_alias(model_name, CFG.model_champion_alias)
     logger.info(f"@{CFG.model_champion_alias}   -> v{champion_mv.version}")
@@ -146,19 +182,21 @@ def deploy():
     split = ", ".join(f"{r.served_model_name}={r.traffic_percentage}%" for r in routes)
     logger.info(f"Deployment complete ({split}).")
 
-    # Enable AI Gateway inference table + usage tracking
-    w.serving_endpoints.put_ai_gateway(
-        name=CFG.endpoint_name,
-        inference_table_config=AiGatewayInferenceTableConfig(
-            catalog_name=CFG.catalog,
-            schema_name=CFG.schema,
-            enabled=True,
-        ),
-        usage_tracking_config=AiGatewayUsageTrackingConfig(
-            enabled=True,
-        ),
+    # Enable AI Gateway inference table + usage tracking via REST
+    w.serving_endpoints.wait_get_serving_endpoint_not_updating(
+        name=CFG.endpoint_name, timeout=WAIT_TIMEOUT
     )
-    logger.info(f"AI Gateway logging enabled -> {CFG.catalog}.{CFG.schema}")
+    gw = _enable_ai_gateway()
+    itc = gw.get("inference_table_config") or {}
+    if not itc.get("enabled"):
+        raise RuntimeError(f"PUT ai-gateway returned without an enabled inference table: {gw}")
+    logger.info(
+        f"AI Gateway inference table active -> "
+        f"{itc.get('catalog_name')}.{itc.get('schema_name')}.{itc.get('table_name_prefix')}_payload"
+    )
+    w.serving_endpoints.wait_get_serving_endpoint_not_updating(
+        name=CFG.endpoint_name, timeout=WAIT_TIMEOUT
+    )
 
 # COMMAND ----------
 
